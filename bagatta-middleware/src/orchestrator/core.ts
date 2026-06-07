@@ -5,6 +5,7 @@ import { alegraConnector } from './connectors/alegra';
 import { auditService } from '../services/audit';
 import { sseService } from '../services/sse';
 import { env } from '../config/env';
+import { getAlegraIds } from '../services/alegraBootstrap';
 import { AlegraItemCreatePayload, SyncCycleResult, ShopifyProduct } from '../types';
 import { buildIdempotencyKey } from '../utils/idempotency';
 
@@ -52,6 +53,21 @@ class OrchestratorCore {
           // El catchup ya actualizó sync_state — salir del ciclo normal
           return result;
         }
+      }
+
+      // ── Detectar productos nuevos en Shopify no registrados en catalog ────
+      // El webhook products/create es el canal principal, pero puede fallar.
+      // Esta verificación actúa como red de seguridad: cada N ciclos compara
+      // todos los SKUs de Shopify contra product_catalog y crea los faltantes.
+      // Usa el mismo patrón del v4: requiere verlo 2 ciclos seguidos antes de
+      // actuar (evita crear por variantes temporalmente sin stock o incompletas).
+      try {
+        await this.detectNewShopifyProducts();
+      } catch (err) {
+        const msg = `Error en detección de productos nuevos: ${(err as Error).message}`;
+        logger.warn(msg);
+        result.errors.push(msg);
+        // No abortar — continuar con el ciclo de reconciliación normal
       }
 
       // ── Obtener todos los SKUs sincronizados activos ───────────────────────
@@ -285,82 +301,91 @@ class OrchestratorCore {
     try {
       let skusReconciled = 0;
 
-      // ── 1. Órdenes de Shopify durante el downtime (paginadas) ─────────────
-      const shopifyOrders = await shopifyConnector.getOrdersSince(since);
-      const shopifyDeltas = new Map<string, number>();
+      // ── Catchup rediseñado: comparación directa de stock actual ───────────
+      //
+      // El enfoque original usaba GET /orders.json para calcular deltas por
+      // órdenes, pero ese endpoint requiere aprobación especial de Shopify para
+      // "protected customer data" (error 403 en apps no aprobadas).
+      //
+      // Solución equivalente y más robusta: leer el stock ACTUAL de cada
+      // plataforma y aplicar la misma fórmula de delta que usa el ciclo normal.
+      // El resultado es idéntico — si hubo ventas durante el downtime, el stock
+      // actual será menor que el _last guardado en master_inventory, y el delta
+      // se calcula igual:
+      //   delta_shopify = stock_shopify_last - stock_shopify_actual
+      //   delta_alegra  = stock_alegra_last  - stock_alegra_actual
+      //   stock_nuevo   = stock_global - delta_shopify - delta_alegra
+      //
+      // Esta estrategia no requiere permisos de órdenes ni datos de clientes.
 
-      for (const order of shopifyOrders) {
-        for (const item of order.line_items) {
-          if (!item.sku) continue;
-          shopifyDeltas.set(item.sku, (shopifyDeltas.get(item.sku) ?? 0) + item.quantity);
-        }
-      }
+      const catalog = await prisma.productCatalog.findMany({
+        where:   { status: 'active' },
+        include: { inventory: true },
+      });
 
-      // ── 2. Movimientos de Alegra durante el downtime ───────────────────────
-      const alegraMovements = await alegraConnector.getInventoryMovementsSince(since);
-      const alegraDeltas    = new Map<string, number>();
+      for (const entry of catalog) {
+        if (!entry.inventory) continue;
 
-      for (const movement of alegraMovements) {
-        for (const ii of movement.inventoryItems) {
-          const ref = ii.item?.reference;
-          if (!ref) continue;
-          // Solo contar movimientos de salida (ventas) — cantidades negativas
-          const absQty = Math.abs(ii.quantity);
-          if (ii.quantity < 0) {
-            alegraDeltas.set(ref, (alegraDeltas.get(ref) ?? 0) + absQty);
-          }
-        }
-      }
+        const { sku, shopifyVariantId, alegraItemId } = entry;
+        const master = entry.inventory;
 
-      // ── 3. Reconciliar cada SKU afectado ──────────────────────────────────
-      const affectedSkus = new Set([...shopifyDeltas.keys(), ...alegraDeltas.keys()]);
+        try {
+          // Leer stock actual en ambas plataformas (igual que reconcileSku)
+          const shopifyInventoryItemId = await shopifyConnector.getVariantInventoryItemId(shopifyVariantId);
+          const currentShopify = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
+          const alegraItem     = await alegraConnector.getItem(alegraItemId);
+          const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
 
-      for (const sku of affectedSkus) {
-        const inventory = await prisma.masterInventory.findUnique({ where: { sku } });
-        if (!inventory) continue;
+          // Calcular deltas reales acumulados durante el downtime
+          const deltaShopify = master.stockShopifyLast - currentShopify;
+          const deltaAlegra  = master.stockAlegraLast  - currentAlegra;
 
-        const dShopify  = shopifyDeltas.get(sku) ?? 0;
-        const dAlegra   = alegraDeltas.get(sku)  ?? 0;
-        const newGlobal = Math.max(0, inventory.stockGlobal - dShopify - dAlegra);
+          if (deltaShopify === 0 && deltaAlegra === 0) continue; // sin cambios
 
-        if (newGlobal === inventory.stockGlobal) continue;
+          const oldGlobal = master.stockGlobal;
+          const newGlobal = Math.max(0, oldGlobal - deltaShopify - deltaAlegra);
 
-        const catalog = await prisma.productCatalog.findUnique({ where: { sku } });
-        if (!catalog) continue;
-
-        await prisma.masterInventory.update({
-          where: { sku },
-          data:  {
-            stockGlobal:      newGlobal,
-            stockShopifyLast: newGlobal,
-            stockAlegraLast:  newGlobal,
-            lastUpdatedBy:    'catchup_sync',
-          },
-        });
-
-        // Propagar a Shopify
-        const invItemId = await shopifyConnector.getVariantInventoryItemId(catalog.shopifyVariantId);
-        await shopifyConnector.setInventoryLevel(invItemId, newGlobal);
-
-        // Propagar a Alegra (ajuste relativo)
-        const adjustQty = newGlobal - inventory.stockAlegraLast;
-        if (adjustQty !== 0) {
-          await alegraConnector.adjustStock(
-              catalog.alegraItemId,
-              adjustQty,
-              `Catchup sync — downtime de ${gapMinutes.toFixed(0)} min`,
+          logger.info(
+              `Catchup SKU ${sku}: master=${oldGlobal}, ` +
+              `Δshopify=${deltaShopify}, Δalegra=${deltaAlegra} → nuevo=${newGlobal}`,
           );
+
+          await prisma.masterInventory.update({
+            where: { sku },
+            data:  {
+              stockGlobal:      newGlobal,
+              stockShopifyLast: newGlobal,
+              stockAlegraLast:  newGlobal,
+              lastUpdatedBy:    'catchup_sync',
+            },
+          });
+
+          // Propagar a Shopify
+          await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+
+          // Propagar a Alegra (ajuste relativo al stock actual)
+          const adjustQty = newGlobal - currentAlegra;
+          if (adjustQty !== 0) {
+            await alegraConnector.adjustStock(
+                alegraItemId,
+                adjustQty,
+                `Catchup sync — downtime de ${gapMinutes.toFixed(0)} min`,
+            );
+          }
+
+          await auditService.logStockChange({
+            sku,
+            oldStock:       oldGlobal,
+            newStock:       newGlobal,
+            origin:         'catchup_sync',
+            sourceEventRef: `catchup_${since.toISOString()}`,
+          });
+
+          skusReconciled++;
+        } catch (skuErr) {
+          logger.error(`Catchup: error reconciliando SKU ${sku}:`, skuErr);
+          // Continuar con el siguiente SKU — no abortar todo el catchup por uno
         }
-
-        await auditService.logStockChange({
-          sku,
-          oldStock:       inventory.stockGlobal,
-          newStock:       newGlobal,
-          origin:         'catchup_sync',
-          sourceEventRef: `catchup_${since.toISOString()}`,
-        });
-
-        skusReconciled++;
       }
 
       // ── 4. Alerta si el downtime fue significativo ─────────────────────────
@@ -395,6 +420,97 @@ class OrchestratorCore {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  //  DETECCIÓN DE PRODUCTOS NUEVOS EN SHOPIFY (red de seguridad del polling)
+  //
+  //  El webhook products/create es el canal principal. Este método es la red
+  //  de seguridad: compara todos los SKUs activos de Shopify contra
+  //  product_catalog y crea los que faltan.
+  //
+  //  Patrón del contador de confirmación (idéntico al v4):
+  //  - Primera vez que se detecta un SKU nuevo → pendingConfirmation[sku] = 1
+  //  - Segunda vez consecutiva               → se activa handleProductCreate
+  //  - Esto evita crear variantes que Shopify está procesando (estado temporal)
+  //
+  //  El mapa en memoria se resetea al reiniciar el proceso, lo que es correcto:
+  //  el peor caso es esperar 2 ciclos adicionales (20 segundos) tras un restart.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private pendingNewProducts = new Map<string, { product: ShopifyProduct; count: number }>();
+
+  private async detectNewShopifyProducts(): Promise<void> {
+    // Traer todos los productos de Shopify de una sola vez
+    const shopifyProducts = await shopifyConnector.listProducts();
+    if (!shopifyProducts.length) return;
+
+    // Construir Set de variant IDs ya registrados en catalog (lookup O(1))
+    const registeredVariantIds = new Set(
+        (await prisma.productCatalog.findMany({ select: { shopifyVariantId: true } }))
+            .map((r: { shopifyVariantId: string }) => r.shopifyVariantId),
+    );
+
+    // Agrupar variantes nuevas por producto
+    const newByProductId = new Map<string, ShopifyProduct>();
+
+    for (const product of shopifyProducts) {
+      const newVariants = product.variants.filter(
+          (v) =>
+              // Solo requiere SKU definido y no estar ya en catalog.
+              // inventory_management puede ser null en Shopify cuando el tracking
+              // no está activado en la location — eso NO impide la creación en Alegra.
+              v.sku &&
+              v.sku.trim() !== '' &&
+              !registeredVariantIds.has(String(v.id)),
+      );
+
+      if (newVariants.length === 0) continue;
+
+      const productId = String(product.id);
+      newByProductId.set(productId, { ...product, variants: newVariants });
+    }
+
+    // Limpiar del mapa productos que ya no tienen variantes nuevas
+    for (const productId of this.pendingNewProducts.keys()) {
+      if (!newByProductId.has(productId)) {
+        this.pendingNewProducts.delete(productId);
+      }
+    }
+
+    // Procesar cada producto con variantes nuevas
+    for (const [productId, product] of newByProductId) {
+      const pending = this.pendingNewProducts.get(productId);
+
+      if (!pending) {
+        // Primera detección — guardar en mapa, esperar confirmación
+        this.pendingNewProducts.set(productId, { product, count: 1 });
+        logger.info(
+            `[DetectNew] Producto "${product.title}" (id=${productId}) tiene ` +
+            `${product.variants.length} variante(s) nueva(s). Esperando confirmación (ciclo 1/2).`,
+        );
+        continue;
+      }
+
+      // Segunda detección consecutiva — confirmar y crear
+      pending.count++;
+      pending.product = product; // actualizar con datos frescos
+
+      if (pending.count >= 2) {
+        logger.info(
+            `[DetectNew] Confirmado: creando ${product.variants.length} variante(s) de ` +
+            `"${product.title}" (id=${productId}) que no llegaron por webhook.`,
+        );
+
+        try {
+          await this.handleProductCreate(product);
+          // Limpiar del mapa — ya fue procesado
+          this.pendingNewProducts.delete(productId);
+        } catch (err) {
+          logger.error(`[DetectNew] Error creando producto ${productId}:`, err);
+          // Mantener en mapa para reintentar en el siguiente ciclo
+        }
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   //  CREACIÓN DE PRODUCTO DESDE SHOPIFY (webhook products/create)
   //  Una variante Shopify → un ítem independiente en Alegra.
   // ═══════════════════════════════════════════════════════════════════════════
@@ -413,10 +529,17 @@ class OrchestratorCore {
         continue;
       }
 
-      // ── Solo sincronizar variantes gestionadas por Shopify ────────────────
+      // ── Tracking de inventario ────────────────────────────────────────────
+      // inventory_management puede ser null cuando el tracking no está activado
+      // en la location de Shopify. Esto NO impide crear el ítem en Alegra — solo
+      // significa que el stock inicial puede ser 0. Se loguea como advertencia
+      // informativa pero la creación continúa normalmente.
       if (variant.inventory_management !== 'shopify') {
-        logger.debug(`Variante ${variant.sku} no gestionada por Shopify. Omitida.`);
-        continue;
+        logger.warn(
+            `Variante "${variant.sku}" (id=${variant.id}): ` +
+            `inventory_management="${variant.inventory_management ?? 'null'}". ` +
+            `El stock inicial será 0. Activa "Track quantity" en Shopify para sincronizar stock.`,
+        );
       }
 
       // ── Idempotencia: si ya existe en catalog → skip ──────────────────────
@@ -437,17 +560,20 @@ class OrchestratorCore {
             : 0;
 
         // ── Crear ítem en Alegra ──────────────────────────────────────────
+        // Los IDs de categoría y bodega se obtienen del bootstrap (resueltos
+        // por nombre al arrancar). env.ALEGRA_WAREHOUSE_ID no existe — usar getAlegraIds().
+        const { categoryId, warehouseId } = getAlegraIds();
         const payload: AlegraItemCreatePayload = {
           name:      itemName,
           reference: variant.sku,
-          category:  { id: env.ALEGRA_SYNC_CATEGORY_ID },
+          category:  { id: categoryId },
           inventory: {
             unit:            env.ALEGRA_UNIT_OF_MEASURE,
             initialQuantity: variant.inventory_quantity,
             unitCost:        cost > 0 ? cost : undefined,
             minQuantity:     0,
             warehouses: [{
-              id:              env.ALEGRA_WAREHOUSE_ID,
+              id:              warehouseId,
               initialQuantity: variant.inventory_quantity,
             }],
           },

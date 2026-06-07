@@ -7,52 +7,55 @@ import { apiRateLimiter } from './middlewares/rateLimit';
 import { errorHandler } from './middlewares/errorHandler';
 
 // Routes
-import authRouter      from './routes/auth';
-import statusRouter    from './routes/status';
-import inventoryRouter from './routes/inventory';
-import productsRouter  from './routes/products';
-import auditRouter     from './routes/audit';
-import syncRouter      from './routes/sync';
-import alertsRouter    from './routes/alerts';
-import configRouter    from './routes/config';
-import webhooksRouter  from './routes/webhooks';
+import authRouter       from './routes/auth';
+import statusRouter     from './routes/status';
+import inventoryRouter  from './routes/inventory';
+import productsRouter   from './routes/products';
+import auditRouter      from './routes/audit';
+import syncRouter       from './routes/sync';
+import alertsRouter     from './routes/alerts';
+import configRouter     from './routes/config';
+import webhooksRouter   from './routes/webhooks';
+import shopifySetupRouter from './routes/shopifySetup';
 
 export function createApp(): express.Application {
   const app = express();
 
-  // ── Trust proxy (Render, Vercel, etc.) ───────────────────────────────────
   app.set('trust proxy', 1);
 
-  // ── Seguridad global ──────────────────────────────────────────────────────
   app.use(helmet({
     hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
   }));
 
   app.use(cors({
-    origin:      env.CORS_ALLOWED_ORIGIN,
-    methods:     ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    origin:         env.CORS_ALLOWED_ORIGIN,
+    methods:        ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key'],
-    credentials: true,
+    credentials:    true,
   }));
 
-  // ── Body parsing ──────────────────────────────────────────────────────────
-  // Los webhooks necesitan el raw body para validar HMAC → guardarlo antes de parsear
+  // Los webhooks necesitan el raw body para validar HMAC
   app.use(
-    express.json({
-      verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
-        req.rawBody = buf;
-      },
-    }),
+      express.json({
+        verify: (req: Request & { rawBody?: Buffer }, _res, buf) => {
+          req.rawBody = buf;
+        },
+      }),
   );
 
-  // ── Middlewares globales ──────────────────────────────────────────────────
   app.use(requestIdMiddleware);
   app.use(apiRateLimiter);
 
-  // ── Health check público (sin auth — para Render health checks) ───────────
+  // ── Health check público ──────────────────────────────────────────────────
   app.get('/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok', ts: new Date().toISOString() });
   });
+
+  // ── Setup (solo en development o cuando falta el token) ───────────────────
+  // GET /setup/shopify/install  → inicia el OAuth de Shopify
+  // GET /setup/shopify/callback → recibe el code y guarda el shpat_
+  // GET /setup/shopify/verify   → verifica que el token actual es válido
+  app.use('/setup', shopifySetupRouter);
 
   // ── API Routes ────────────────────────────────────────────────────────────
   app.use('/api/v1/auth',      authRouter);
@@ -65,12 +68,13 @@ export function createApp(): express.Application {
   app.use('/api/v1/config',    configRouter);
   app.use('/api/v1/webhooks',  webhooksRouter);
 
-  // ── 404 handler ───────────────────────────────────────────────────────────
+  // ── 404 ───────────────────────────────────────────────────────────────────
   app.use((_req: Request, res: Response) => {
-    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Ruta no encontrada', timestamp: new Date().toISOString() } });
+    res.status(404).json({
+      error: { code: 'NOT_FOUND', message: 'Ruta no encontrada', timestamp: new Date().toISOString() },
+    });
   });
 
-  // ── Error handler global ──────────────────────────────────────────────────
   app.use(errorHandler);
 
   return app;

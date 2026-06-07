@@ -1,113 +1,133 @@
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { ShopifyProduct, ShopifyInventoryLevel } from '../../types';
+import { shopifyTokenManager } from './shopify-auth';
+
+/**
+ * Normaliza el SHOPIFY_LOCATION_ID.
+ * Acepta formato GID GraphQL (gid://shopify/Location/118506684576)
+ * y formato numérico simple (118506684576).
+ * La REST API requiere solo el número.
+ */
+function normalizeLocationId(raw: string): string {
+  if (raw.startsWith('gid://')) {
+    const parts = raw.split('/');
+    return parts[parts.length - 1];
+  }
+  return raw;
+}
+
+const LOCATION_ID = normalizeLocationId(env.SHOPIFY_LOCATION_ID);
 
 class ShopifyConnector {
-  private client: AxiosInstance;
+  private baseURL: string;
 
   constructor() {
-    this.client = axios.create({
-      baseURL: `https://${env.SHOPIFY_SHOP_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}`,
+    this.baseURL = `https://${env.SHOPIFY_SHOP_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}`;
+    logger.info(`Shopify connector: ${this.baseURL} | Location: ${LOCATION_ID}`);
+  }
+
+  private getClient(): AxiosInstance {
+    const token = shopifyTokenManager.getToken();
+    const client = axios.create({
+      baseURL: this.baseURL,
       headers: {
-        'X-Shopify-Access-Token': env.SHOPIFY_ACCESS_TOKEN,
+        'X-Shopify-Access-Token': token,
         'Content-Type': 'application/json',
       },
       timeout: 15000,
     });
 
-    this.client.interceptors.response.use(
+    client.interceptors.response.use(
         (r) => r,
-        (err) => {
+        (err: AxiosError) => {
           const status = err.response?.status;
           const url    = err.config?.url;
-          logger.error(`Shopify API error ${status} en ${url}`, { data: err.response?.data });
+          const data   = err.response?.data;
+          if (status === 401) {
+            shopifyTokenManager.markInvalid();
+            logger.error(`Shopify 401 en ${url} — token inválido`, { data });
+          } else {
+            logger.error(`Shopify API error ${status} en ${url}`, { data });
+          }
           throw err;
         },
     );
+    return client;
   }
 
-  // ── Productos ────────────────────────────────────────────────────────────────
+  private assertTokenValid(): void {
+    if (!shopifyTokenManager.isValid()) {
+      throw new Error('Shopify no autenticado. Visita http://localhost:3000/setup/shopify/install');
+    }
+  }
+
+  async verifyConnection(): Promise<{ name: string; domain: string }> {
+    const { data } = await this.getClient().get('/shop.json');
+    return { name: data.shop?.name, domain: data.shop?.myshopify_domain };
+  }
 
   async getProduct(productId: string): Promise<ShopifyProduct> {
-    const { data } = await this.client.get(`/products/${productId}.json`);
+    this.assertTokenValid();
+    const { data } = await this.getClient().get(`/products/${productId}.json`);
     return data.product as ShopifyProduct;
   }
 
   async listProducts(sinceId?: string): Promise<ShopifyProduct[]> {
+    this.assertTokenValid();
     const params: Record<string, string> = { limit: '250' };
     if (sinceId) params.since_id = sinceId;
-    const { data } = await this.client.get('/products.json', { params });
+    const { data } = await this.getClient().get('/products.json', { params });
     return data.products as ShopifyProduct[];
   }
 
-  // ── Inventario ───────────────────────────────────────────────────────────────
-
   async getInventoryLevel(inventoryItemId: number): Promise<number> {
-    const { data } = await this.client.get('/inventory_levels.json', {
-      params: {
-        inventory_item_ids: inventoryItemId,
-        location_ids:       env.SHOPIFY_LOCATION_ID,
-      },
+    this.assertTokenValid();
+    const { data } = await this.getClient().get('/inventory_levels.json', {
+      params: { inventory_item_ids: inventoryItemId, location_ids: LOCATION_ID },
     });
     const level = (data.inventory_levels as ShopifyInventoryLevel[])[0];
     return level?.available ?? 0;
   }
 
-  /**
-   * Ajusta el inventario de una variante en Shopify.
-   * Usa `set` (valor absoluto) para garantizar consistencia — no `adjust` (relativo).
-   */
   async setInventoryLevel(inventoryItemId: number, quantity: number): Promise<void> {
-    await this.client.post('/inventory_levels/set.json', {
-      location_id:       parseInt(env.SHOPIFY_LOCATION_ID, 10),
+    this.assertTokenValid();
+    await this.getClient().post('/inventory_levels/set.json', {
+      location_id: parseInt(LOCATION_ID, 10),
       inventory_item_id: inventoryItemId,
-      available:         quantity,
+      available: quantity,
     });
     logger.debug(`Shopify: inventory_item ${inventoryItemId} → ${quantity}`);
   }
 
-  /**
-   * Actualiza el precio de una variante.
-   */
   async updateVariantPrice(variantId: string, price: string): Promise<void> {
-    await this.client.put(`/variants/${variantId}.json`, {
+    this.assertTokenValid();
+    await this.getClient().put(`/variants/${variantId}.json`, {
       variant: { id: variantId, price },
     });
     logger.debug(`Shopify: variant ${variantId} precio → ${price}`);
   }
 
-  /**
-   * Obtiene el cost por item de una variante leyendo el InventoryItem.
-   * El costo no viene en el payload de webhook — requiere una llamada adicional.
-   * Devuelve 0 si no está disponible o el campo no está en los permisos.
-   */
   async getVariantCost(inventoryItemId: number): Promise<number> {
+    this.assertTokenValid();
     try {
-      const { data } = await this.client.get(`/inventory_items/${inventoryItemId}.json`);
+      const { data } = await this.getClient().get(`/inventory_items/${inventoryItemId}.json`);
       const cost = data.inventory_item?.cost;
       return cost ? parseFloat(cost) : 0;
-    } catch (err) {
-      logger.warn(`Shopify: no se pudo obtener costo de inventory_item ${inventoryItemId}`, err);
+    } catch {
+      logger.warn(`Shopify: no se pudo obtener costo de inventory_item ${inventoryItemId}`);
       return 0;
     }
   }
 
-  /**
-   * Obtiene todas las órdenes creadas después de `createdAtMin`.
-   * Pagina automáticamente usando cursor-based pagination de Shopify.
-   * Usado en polling y catchup sync para calcular deltas de venta.
-   */
   async getOrdersSince(createdAtMin: Date): Promise<Array<{
-    id: number;
-    name: string;
-    created_at: string;
+    id: number; name: string; created_at: string;
     line_items: Array<{ variant_id: number; sku: string; quantity: number }>;
   }>> {
+    this.assertTokenValid();
     const allOrders: Array<{
-      id: number;
-      name: string;
-      created_at: string;
+      id: number; name: string; created_at: string;
       line_items: Array<{ variant_id: number; sku: string; quantity: number }>;
     }> = [];
 
@@ -116,10 +136,11 @@ class ShopifyConnector {
 
     while (true) {
       const params: Record<string, string> = {
-        status:         'any',
-        limit:          '250',
-        fields:         'id,name,created_at,line_items',
-        financial_status: 'paid',
+        status: 'any',
+        limit:  '250',
+        // Solo campos no protegidos — evita el 403 de "protected customer data".
+        // El middleware solo necesita SKU y cantidad para calcular deltas de stock.
+        fields: 'id,created_at,line_items',
       };
 
       if (isFirstPage) {
@@ -128,40 +149,31 @@ class ShopifyConnector {
       } else if (pageInfo) {
         params.page_info = pageInfo;
       } else {
-        break; // no hay más páginas
+        break;
       }
 
-      const { data, headers } = await this.client.get('/orders.json', { params });
+      const { data, headers } = await this.getClient().get('/orders.json', { params });
       const orders = data.orders ?? [];
       allOrders.push(...orders);
 
-      // Extraer cursor de paginación del header Link
       const linkHeader = headers['link'] as string | undefined;
       pageInfo = this.extractNextPageInfo(linkHeader);
-
       if (!pageInfo || orders.length < 250) break;
     }
 
     return allOrders;
   }
 
-  /**
-   * Extrae el page_info del header Link de Shopify.
-   * Formato: <url?page_info=xxx>; rel="next"
-   */
+  async getVariantInventoryItemId(variantId: string): Promise<number> {
+    this.assertTokenValid();
+    const { data } = await this.getClient().get(`/variants/${variantId}.json`);
+    return data.variant.inventory_item_id as number;
+  }
+
   private extractNextPageInfo(linkHeader?: string): string | undefined {
     if (!linkHeader) return undefined;
     const match = linkHeader.match(/<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"/);
     return match ? match[1] : undefined;
-  }
-
-  /**
-   * Obtiene el inventory_item_id de una variante.
-   * Necesario para llamar a inventory_levels y getVariantCost.
-   */
-  async getVariantInventoryItemId(variantId: string): Promise<number> {
-    const { data } = await this.client.get(`/variants/${variantId}.json`);
-    return data.variant.inventory_item_id as number;
   }
 }
 

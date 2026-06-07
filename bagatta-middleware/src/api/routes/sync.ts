@@ -4,6 +4,7 @@ import { orchestrator } from '../../orchestrator/core';
 import { sseService } from '../../services/sse';
 import { auditService } from '../../services/audit';
 import { prisma } from '../../db/prisma';
+import { shopifyConnector } from '../../orchestrator/connectors/shopify';
 import { NotFoundError, CatchupInProgressError } from '../../utils/errors';
 import { buildIdempotencyKey } from '../../utils/idempotency';
 import { v4 as uuidv4 } from 'uuid';
@@ -84,5 +85,118 @@ router.post('/force/global', verifyJwt, requireRole('operator'), async (_req: Re
     next(err);
   }
 });
+
+// ── POST /sync/ingest-product/:shopifyProductId ───────────────────────────────
+// Recuperación manual de un producto que no fue captado por el webhook.
+// Busca el producto directamente en la API de Shopify y ejecuta el flujo
+// de creación como si hubiera llegado el webhook products/create.
+// Útil cuando: el webhook falló por HMAC, el middleware estaba caído,
+// o el producto fue creado antes de instalar la app.
+router.post(
+  '/ingest-product/:shopifyProductId',
+  verifyJwt,
+  requireRole('operator'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { shopifyProductId } = req.params;
+
+      // Validar que es un ID numérico válido de Shopify
+      if (!/^\d+$/.test(shopifyProductId)) {
+        res.status(400).json({
+          error: {
+            code:    'INVALID_PRODUCT_ID',
+            message: 'El shopifyProductId debe ser un número entero (ej: 1234567890).',
+          },
+        });
+        return;
+      }
+
+      // Obtener el producto directamente desde Shopify
+      let shopifyProduct;
+      try {
+        shopifyProduct = await shopifyConnector.getProduct(shopifyProductId);
+      } catch (err: unknown) {
+        const status = (err as { response?: { status?: number } }).response?.status;
+        if (status === 404) {
+          res.status(404).json({
+            error: {
+              code:    'SHOPIFY_PRODUCT_NOT_FOUND',
+              message: `El producto ${shopifyProductId} no existe en Shopify.`,
+            },
+          });
+        } else {
+          res.status(502).json({
+            error: {
+              code:    'SHOPIFY_API_ERROR',
+              message: `Error consultando Shopify: ${(err as Error).message}`,
+            },
+          });
+        }
+        return;
+      }
+
+      // Diagnóstico previo: qué variantes tienen problemas
+      const diagnostics = shopifyProduct.variants.map((v) => ({
+        variant_id:           v.id,
+        sku:                  v.sku || '(sin SKU)',
+        inventory_management: v.inventory_management,
+        inventory_quantity:   v.inventory_quantity,
+        already_in_catalog:   false, // se actualiza abajo
+        will_be_synced:       !!(v.sku && v.inventory_management === 'shopify'),
+        skip_reason:          !v.sku
+          ? 'Sin SKU'
+          : v.inventory_management !== 'shopify'
+            ? `inventory_management="${v.inventory_management ?? 'null'}" (debe ser "shopify")`
+            : null,
+      }));
+
+      // Marcar cuáles ya están en el catálogo
+      for (const diag of diagnostics) {
+        if (diag.sku && diag.sku !== '(sin SKU)') {
+          const exists = await prisma.productCatalog.findUnique({ where: { sku: diag.sku } });
+          diag.already_in_catalog = !!exists;
+        }
+      }
+
+      const willSync   = diagnostics.filter((d) => d.will_be_synced && !d.already_in_catalog);
+      const skipped    = diagnostics.filter((d) => !d.will_be_synced || d.already_in_catalog);
+
+      if (willSync.length === 0) {
+        res.json({
+          status:       'nothing_to_do',
+          product_id:   shopifyProductId,
+          product_title: shopifyProduct.title,
+          message:      'Ninguna variante requiere sincronización. Ver diagnóstico.',
+          diagnostics,
+        });
+        return;
+      }
+
+      // Ejecutar el flujo de creación (idempotente — skipea los que ya existen)
+      await orchestrator.handleProductCreate(shopifyProduct);
+
+      // Verificar qué quedó efectivamente creado
+      const created: string[] = [];
+      for (const diag of willSync) {
+        const inCatalog = await prisma.productCatalog.findUnique({ where: { sku: diag.sku } });
+        if (inCatalog) created.push(diag.sku);
+      }
+
+      res.json({
+        status:        'completed',
+        product_id:    shopifyProductId,
+        product_title: shopifyProduct.title,
+        variants_synced: created,
+        variants_skipped: skipped.map((d) => ({
+          sku:         d.sku,
+          reason:      d.already_in_catalog ? 'Ya estaba en el catálogo' : d.skip_reason,
+        })),
+        diagnostics,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 export default router;

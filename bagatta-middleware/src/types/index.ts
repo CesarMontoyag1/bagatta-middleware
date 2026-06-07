@@ -96,7 +96,8 @@ export interface ShopifyProduct {
 
 export interface ShopifyOrder {
   id: number;
-  name: string;
+  name?: string;      // opcional — no se pide en queries para evitar 403 de datos protegidos
+  created_at?: string;
   line_items: Array<{
     variant_id: number;
     sku: string;

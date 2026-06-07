@@ -5,6 +5,7 @@ import { UserRole } from '@prisma/client';
 import { JWT_PUBLIC_KEY, env } from '../../config/env';
 import { JwtPayload } from '../../types';
 import { UnauthorizedError, ForbiddenError } from '../../utils/errors';
+import { prisma } from '../../db/prisma';
 
 // ── JWT verification ──────────────────────────────────────────────────────────
 export function verifyJwt(req: Request, _res: Response, next: NextFunction): void {
@@ -65,6 +66,14 @@ export function verifyShopifyHmac(req: Request, _res: Response, next: NextFuncti
   const hmacHeader = req.headers['x-shopify-hmac-sha256'] as string | undefined;
 
   if (!hmacHeader) {
+    // Registrar intento sin firma — puede ser un ataque o un misconfiguration
+    prisma.alert.create({
+      data: {
+        type:   'webhook_hmac_failure',
+        detail: `Webhook recibido en ${req.path} sin header X-Shopify-Hmac-Sha256. ` +
+                `IP: ${req.ip}. Posible petición no autorizada o mal configurada.`,
+      },
+    }).catch(() => {}); // fire-and-forget
     return next(new UnauthorizedError('Firma HMAC de Shopify ausente'));
   }
 
@@ -87,6 +96,18 @@ export function verifyShopifyHmac(req: Request, _res: Response, next: NextFuncti
     digestBuffer.length !== headerBuffer.length ||
     !crypto.timingSafeEqual(digestBuffer, headerBuffer)
   ) {
+    // HMAC inválido: el secreto en .env no coincide con el de Shopify.
+    // Registrar alerta visible en el dashboard para que el operador lo detecte.
+    prisma.alert.create({
+      data: {
+        type:   'webhook_hmac_failure',
+        detail: `HMAC inválido en webhook ${req.path}. ` +
+                `El SHOPIFY_WEBHOOK_SECRET del middleware no coincide con el secreto ` +
+                `configurado en Shopify → Settings → Notifications → Webhooks. ` +
+                `Los webhooks de Shopify están siendo rechazados — los productos ` +
+                `creados en Shopify NO se sincronizan con Alegra hasta que se corrija.`,
+      },
+    }).catch(() => {}); // fire-and-forget — no bloquear el rechazo
     return next(new UnauthorizedError('Firma HMAC de Shopify inválida'));
   }
 

@@ -7,49 +7,53 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT:     z.coerce.number().default(3000),
 
-  // ── Base de datos ──────────────────────────────────────────────────────────
-  DATABASE_URL: z.string().min(1, 'DATABASE_URL es obligatoria'),
-  DIRECT_URL:   z.string().min(1, 'DIRECT_URL es obligatoria'),
+  DATABASE_URL: z.string().min(1),
+  DIRECT_URL:   z.string().min(1),
 
-  // ── JWT (llaves en base64 para evitar problemas con saltos de línea en .env)
-  JWT_PRIVATE_KEY_B64:   z.string().min(1, 'JWT_PRIVATE_KEY_B64 es obligatoria'),
-  JWT_PUBLIC_KEY_B64:    z.string().min(1, 'JWT_PUBLIC_KEY_B64 es obligatoria'),
-  JWT_ACCESS_EXPIRES_IN: z.string().default('8h'),
-  SYSTEM_INTERNAL_SECRET: z.string().min(32, 'SYSTEM_INTERNAL_SECRET debe tener al menos 32 caracteres'),
+  JWT_PRIVATE_KEY_B64:    z.string().min(1),
+  JWT_PUBLIC_KEY_B64:     z.string().min(1),
+  JWT_ACCESS_EXPIRES_IN:  z.string().default('8h'),
+  JWT_REFRESH_EXPIRES_IN: z.string().default('30d'),
+  SYSTEM_INTERNAL_SECRET: z.string().min(32),
 
-  // ── Shopify ────────────────────────────────────────────────────────────────
-  SHOPIFY_SHOP_DOMAIN:    z.string().min(1, 'SHOPIFY_SHOP_DOMAIN es obligatoria'),
-  SHOPIFY_ACCESS_TOKEN:   z.string().min(1, 'SHOPIFY_ACCESS_TOKEN es obligatoria'),
+  // ── Shopify ──────────────────────────────────────────────────────────────
+  SHOPIFY_SHOP_DOMAIN:    z.string().min(1),
   SHOPIFY_API_VERSION:    z.string().default('2024-04'),
-  SHOPIFY_WEBHOOK_SECRET: z.string().min(1, 'SHOPIFY_WEBHOOK_SECRET es obligatoria'),
-  SHOPIFY_LOCATION_ID:    z.string().min(1, 'SHOPIFY_LOCATION_ID es obligatoria'),
+  SHOPIFY_WEBHOOK_SECRET: z.string().min(1),
+  SHOPIFY_LOCATION_ID:    z.string().min(1),
 
-  // ── Alegra ─────────────────────────────────────────────────────────────────
-  ALEGRA_USER_EMAIL:   z.string().email('ALEGRA_USER_EMAIL debe ser un email válido'),
-  ALEGRA_API_TOKEN:    z.string().min(1, 'ALEGRA_API_TOKEN es obligatoria'),
+  // El access token se obtiene via OAuth (/setup/shopify/install).
+  // Puede estar vacío inicialmente — el setup lo completa automáticamente.
+  SHOPIFY_ACCESS_TOKEN: z.string().default(''),
 
-  // Nombres legibles — los IDs se resuelven automáticamente al arrancar
-  // No requieren curl ni búsqueda manual en Alegra
+  // Client ID y Secret: solo necesarios para el flujo OAuth de setup.
+  // Vienen del Partners Dashboard → tu app → Configuración → Credenciales.
+  SHOPIFY_CLIENT_ID:     z.string().default(''),
+  SHOPIFY_CLIENT_SECRET: z.string().default(''),
+
+  // ── Alegra ───────────────────────────────────────────────────────────────
+  ALEGRA_USER_EMAIL:         z.string().email(),
+  ALEGRA_API_TOKEN:          z.string().min(1),
   ALEGRA_SYNC_CATEGORY_NAME: z.string().default('Tienda Virtual y Física'),
   ALEGRA_WAREHOUSE_NAME:     z.string().default('Principal'),
   ALEGRA_UNIT_OF_MEASURE:    z.string().default('Unidad'),
 
-  // ── Sincronización ─────────────────────────────────────────────────────────
-  POLLING_INTERVAL_SECONDS:          z.coerce.number().default(10),
-  CATCHUP_THRESHOLD_MINUTES:         z.coerce.number().default(2),
-  DOWNTIME_ALERT_THRESHOLD_MINUTES:  z.coerce.number().default(5),
-  SELF_PING_INTERVAL_MINUTES:        z.coerce.number().default(10),
+  // ── Sincronización ───────────────────────────────────────────────────────
+  POLLING_INTERVAL_SECONDS:         z.coerce.number().default(10),
+  CATCHUP_THRESHOLD_MINUTES:        z.coerce.number().default(2),
+  DOWNTIME_ALERT_THRESHOLD_MINUTES: z.coerce.number().default(5),
+  SELF_PING_INTERVAL_MINUTES:       z.coerce.number().default(10),
 
-  // ── Rate limiting ──────────────────────────────────────────────────────────
-  RATE_LIMIT_WINDOW_MS:     z.coerce.number().default(60000),
-  RATE_LIMIT_MAX_REQUESTS:  z.coerce.number().default(100),
-  AUTH_RATE_LIMIT_MAX:      z.coerce.number().default(10),
+  // ── Rate limiting ────────────────────────────────────────────────────────
+  RATE_LIMIT_WINDOW_MS:    z.coerce.number().default(60000),
+  RATE_LIMIT_MAX_REQUESTS: z.coerce.number().default(100),
+  AUTH_RATE_LIMIT_MAX:     z.coerce.number().default(10),
 
-  // ── CORS y URLs ────────────────────────────────────────────────────────────
+  // ── CORS y URLs ──────────────────────────────────────────────────────────
   CORS_ALLOWED_ORIGIN: z.string().default('http://localhost:5173'),
   SELF_URL:            z.string().default('http://localhost:3000'),
 
-  // ── Seed ──────────────────────────────────────────────────────────────────
+  // ── Seed ─────────────────────────────────────────────────────────────────
   SEED_ADMIN_EMAIL:    z.string().email().optional(),
   SEED_ADMIN_PASSWORD: z.string().min(12).optional(),
 });
@@ -68,8 +72,5 @@ if (!parsed.success) {
 
 export const env = parsed.data;
 
-// ── JWT decodificado desde base64 ─────────────────────────────────────────────
-// Las llaves se guardan en base64 en el .env para evitar problemas con
-// saltos de línea y caracteres especiales en distintos sistemas operativos.
 export const JWT_PRIVATE_KEY = Buffer.from(env.JWT_PRIVATE_KEY_B64, 'base64').toString('utf-8');
 export const JWT_PUBLIC_KEY  = Buffer.from(env.JWT_PUBLIC_KEY_B64,  'base64').toString('utf-8');
