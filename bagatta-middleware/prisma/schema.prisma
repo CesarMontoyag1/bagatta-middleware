@@ -1,0 +1,294 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Bagatta Middleware — Prisma Schema
+// Modelo de datos diseñado en la Fase de Arquitectura (Punto 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// product_catalog
+// Mapping SKU Shopify ↔ ID Alegra + snapshot del último estado conocido
+// Una fila por variante de producto. Permanente (nunca se borra, se archiva).
+// ─────────────────────────────────────────────────────────────────────────────
+model ProductCatalog {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  // IDs externos — únicos e inmutables una vez asignados
+  shopifyVariantId String @unique @map("shopify_variant_id") @db.VarChar(64)
+  shopifyProductId String @map("shopify_product_id") @db.VarChar(64)
+  alegraItemId     String @unique @map("alegra_item_id") @db.VarChar(64)
+
+  // Clave lógica de sincronización — PK lógica del sistema
+  sku String @unique @db.VarChar(128)
+
+  // Snapshot del último estado conocido (para diff sin llamar APIs)
+  lastKnownName    String  @map("last_known_name") @db.VarChar(255)
+  lastKnownPrice   Decimal @map("last_known_price") @db.Decimal(12, 2)
+  lastKnownCost    Decimal @map("last_known_cost") @db.Decimal(12, 2)
+  lastKnownOption1 String? @map("last_known_option1") @db.VarChar(128) // talla
+  lastKnownOption2 String? @map("last_known_option2") @db.VarChar(128) // color
+
+  // Ciclo de vida
+  status    CatalogStatus @default(active)
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime      @updatedAt @map("updated_at") @db.Timestamptz()
+
+  // Relaciones
+  inventory MasterInventory?
+  auditLogs AuditLog[]
+
+  @@index([sku])
+  @@index([status])
+  @@map("product_catalog")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// master_inventory
+// Single Source of Truth para stock.
+// Una fila por SKU. Fórmula de conflicto:
+//   delta_shopify  = stock_shopify_last - stock_shopify_actual
+//   delta_alegra   = stock_alegra_last  - stock_alegra_actual
+//   stock_nuevo    = stock_global - delta_shopify - delta_alegra
+// ─────────────────────────────────────────────────────────────────────────────
+model MasterInventory {
+  id  String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sku String @unique @db.VarChar(128)
+
+  // Stock global canónico
+  stockGlobal Int @default(0) @map("stock_global")
+
+  // Último valor reportado por cada plataforma (para calcular delta real)
+  stockAlegraLast  Int @default(0) @map("stock_alegra_last")
+  stockShopifyLast Int @default(0) @map("stock_shopify_last")
+
+  lastUpdated   DateTime @default(now()) @map("last_updated") @db.Timestamptz()
+  lastUpdatedBy String   @map("last_updated_by") @db.VarChar(64)
+  // valores: 'orchestrator' | 'catchup_sync' | user_id
+
+  // Relación con catalog (ON UPDATE CASCADE vía trigger en DB)
+  catalog ProductCatalog @relation(fields: [sku], references: [sku])
+
+  @@index([sku])
+  @@map("master_inventory")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// audit_log
+// Log append-only de CADA escritura que toca Alegra o Shopify.
+// NUNCA UPDATE ni DELETE en producción.
+// Un campo cambiado = una fila. Si cambian precio y nombre: dos filas.
+// ─────────────────────────────────────────────────────────────────────────────
+model AuditLog {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  // Garantía de no duplicación (nivel BD, no solo lógica)
+  idempotencyKey String @unique @map("idempotency_key") @db.VarChar(128)
+  // formato recomendado: {origin}:{source_event_ref}:{field_changed}
+
+  // Qué cambió
+  sku          String       @db.VarChar(128)
+  fieldChanged AuditField   @map("field_changed")
+  oldValue     String?      @map("old_value")
+  newValue     String       @map("new_value")
+
+  // Quién lo originó
+  origin AuditOrigin
+
+  // Referencia al evento que lo disparó (order_id, movement_id, webhook_id)
+  sourceEventRef String? @map("source_event_ref") @db.VarChar(255)
+
+  alertTriggered Boolean @default(false) @map("alert_triggered")
+
+  // Append-only — solo INSERT en producción
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  // Relación (opcional — el SKU puede no estar en catalog si es un error)
+  catalog ProductCatalog? @relation(fields: [sku], references: [sku])
+
+  @@index([sku])
+  @@index([createdAt])
+  @@index([idempotencyKey])
+  @@index([alertTriggered])
+  @@map("audit_log")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sync_state
+// Tabla singleton (id=1 siempre). Estado del orquestador en tiempo real.
+// Solo UPDATE, nunca INSERT ni DELETE después del seed inicial.
+// ─────────────────────────────────────────────────────────────────────────────
+model SyncState {
+  id Int @id @default(1)
+  // Constraint CHECK (id = 1) se aplica en la migración SQL
+
+  lastSuccessfulSync DateTime? @map("last_successful_sync") @db.Timestamptz()
+  lastAttemptedSync  DateTime? @map("last_attempted_sync") @db.Timestamptz()
+
+  status           SyncStatus @default(idle)
+  errorDetail      String?    @map("error_detail")
+  consecutiveFailures Int     @default(0) @map("consecutive_failures")
+
+  @@map("sync_state")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// purge_history
+// Log de las ejecuciones del PurgeJob diario.
+// Se limpia a sí mismo (retención 90 días).
+// ─────────────────────────────────────────────────────────────────────────────
+model PurgeHistory {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tableName    String      @map("table_name") @db.VarChar(64)
+  rowsAffected Int         @default(0) @map("rows_affected")
+  cutoffDate   DateTime    @map("cutoff_date") @db.Date
+  status       PurgeStatus
+  errorDetail  String?     @map("error_detail")
+  ranAt        DateTime    @default(now()) @map("ran_at") @db.Timestamptz()
+
+  @@index([ranAt])
+  @@map("purge_history")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// users
+// Usuarios del dashboard. Solo admin puede crear/borrar usuarios.
+// Las contraseñas se almacenan hasheadas con bcrypt (cost=12).
+// ─────────────────────────────────────────────────────────────────────────────
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  role         UserRole @default(readonly)
+  totpSecret   String?  @map("totp_secret") @db.VarChar(64) // para 2FA
+  totpEnabled  Boolean  @default(false) @map("totp_enabled")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  refreshTokens RefreshToken[]
+  loginAttempts LoginAttempt[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// refresh_tokens
+// Tokens de refresco opacos (UUID v4), almacenados hasheados.
+// ─────────────────────────────────────────────────────────────────────────────
+model RefreshToken {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @map("token_hash") @db.VarChar(255) // bcrypt del UUID opaco
+  expiresAt DateTime @map("expires_at") @db.Timestamptz()
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// login_attempts
+// Para brute force protection. Se limpian automáticamente tras la ventana.
+// ─────────────────────────────────────────────────────────────────────────────
+model LoginAttempt {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String?  @map("user_id") @db.Uuid // null si el email no existe
+  ipAddress String   @map("ip_address") @db.VarChar(45)
+  email     String   @db.VarChar(255)
+  success   Boolean
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([ipAddress, createdAt])
+  @@index([email, createdAt])
+  @@map("login_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// alerts
+// Alertas activas que requieren reconocimiento del operador.
+// ─────────────────────────────────────────────────────────────────────────────
+model Alert {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type         AlertType
+  sku          String?     @db.VarChar(128)
+  detail       String
+  auditLogId   String?     @map("audit_log_id") @db.Uuid
+  acknowledged Boolean     @default(false)
+  acknowledgedBy String?   @map("acknowledged_by") @db.VarChar(255)
+  acknowledgedAt DateTime? @map("acknowledged_at") @db.Timestamptz()
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz()
+
+  @@index([acknowledged])
+  @@index([createdAt])
+  @@map("alerts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum CatalogStatus {
+  active
+  archived
+}
+
+enum SyncStatus {
+  idle
+  syncing
+  catchup
+  error
+}
+
+enum AuditOrigin {
+  orchestrator
+  shopify_webhook
+  shopify_polling
+  alegra_polling
+  catchup_sync
+  manual_admin
+}
+
+enum AuditField {
+  stock
+  price
+  cost
+  name
+  status
+  sku
+}
+
+enum PurgeStatus {
+  success
+  partial
+  failed
+}
+
+enum UserRole {
+  readonly
+  operator
+  admin
+  system
+}
+
+enum AlertType {
+  price_conflict
+  cost_conflict
+  sku_migration
+  variant_archived
+  downtime
+  webhook_hmac_failure
+  sku_missing
+  catchup_completed
+}
