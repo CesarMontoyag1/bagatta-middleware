@@ -146,8 +146,11 @@ class OrchestratorCore {
     let anyChange = false;
 
     // ── 1. Obtener stock actual en ambas plataformas ───────────────────────
-    const shopifyInventoryItemId = await shopifyConnector.getVariantInventoryItemId(shopifyVariantId);
-    const currentShopify = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
+    // getVariant devuelve inventory_item_id e inventory_management en una sola llamada
+    const variantData            = await shopifyConnector.getVariant(shopifyVariantId);
+    const shopifyInventoryItemId = variantData.inventory_item_id;
+    const shopifyTracking        = variantData.inventory_management; // null = sin tracking
+    const currentShopify         = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
     const alegraItem     = await alegraConnector.getItem(alegraItemId);
     const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
 
@@ -182,7 +185,18 @@ class OrchestratorCore {
       // ── 5. Propagar a ambas plataformas ──────────────────────────────────
       const sourceRef = `poll_${Date.now()}_${sku}`;
 
-      await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+      // Solo actualizar stock en Shopify si la variante tiene tracking activado.
+      // inventory_management = null significa que Shopify no controla el inventario
+      // de esta variante — setInventoryLevel devuelve 422 en ese caso.
+      if (shopifyTracking === 'shopify') {
+        await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+      } else {
+        logger.debug(
+            `SKU ${sku}: omitiendo setInventoryLevel en Shopify ` +
+            `(inventory_management="${shopifyTracking ?? 'null'}"). ` +
+            `Activa "Track quantity" en Shopify para sincronizar stock bidireccional.`,
+        );
+      }
 
       const adjustQty = newGlobal - currentAlegra;
       if (adjustQty !== 0) {
@@ -331,8 +345,10 @@ class OrchestratorCore {
 
         try {
           // Leer stock actual en ambas plataformas (igual que reconcileSku)
-          const shopifyInventoryItemId = await shopifyConnector.getVariantInventoryItemId(shopifyVariantId);
-          const currentShopify = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
+          const variantData            = await shopifyConnector.getVariant(shopifyVariantId);
+          const shopifyInventoryItemId = variantData.inventory_item_id;
+          const shopifyTracking        = variantData.inventory_management;
+          const currentShopify         = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
           const alegraItem     = await alegraConnector.getItem(alegraItemId);
           const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
 
@@ -562,13 +578,33 @@ class OrchestratorCore {
         // ── Crear ítem en Alegra ──────────────────────────────────────────
         // Los IDs de categoría y bodega se obtienen del bootstrap (resueltos
         // por nombre al arrancar). env.ALEGRA_WAREHOUSE_ID no existe — usar getAlegraIds().
-        const { categoryId, warehouseId } = getAlegraIds();
+        const { categoryId, warehouseId, accountTemplate } = getAlegraIds();
+
+        // Construir el bloque "accounting" que Alegra espera.
+        // IMPORTANTE: según la API oficial de Alegra, los valores de accounting
+        // son strings con el ID directamente — NO objetos { id }.
+        // accounting.inventory             → ID de cuenta de inventario (string)
+        // accounting.inventariablePurchase → ID de cuenta costo de ventas (string)
+        // La cuenta de ingresos va en "category" a nivel raíz (cuenta contable de ventas).
+        // La categoría comercial (de items) va en "itemCategory".
+        const accountingBlock = accountTemplate ? {
+          ...(accountTemplate.inventoryAccount && { inventory:             String(accountTemplate.inventoryAccount.id) }),
+          ...(accountTemplate.saleCost         && { inventariablePurchase: String(accountTemplate.saleCost.id) }),
+        } : undefined;
         const payload: AlegraItemCreatePayload = {
           name:      itemName,
           reference: variant.sku,
-          category:  { id: categoryId },
+          // itemCategory → categoría comercial del ítem (la de "Tienda Virtual y Física")
+          itemCategory: { id: categoryId },
+          // category → cuenta contable de ingresos por ventas (requerida por Alegra)
+          ...(accountTemplate?.saleIncome && { category: { id: String(accountTemplate.saleIncome.id) } }),
+          // accounting → cuentas contables de inventario y costo (IDs como strings simples)
+          ...(accountingBlock && Object.keys(accountingBlock).length > 0 && { accounting: accountingBlock }),
+          ...(accountTemplate?.tax && { tax: [{ id: String(accountTemplate.tax.id) }] }),
           inventory: {
-            unit:            env.ALEGRA_UNIT_OF_MEASURE,
+            // Usar la unidad del ítem plantilla — el código interno de Alegra (ej: "unit")
+            // puede diferir del nombre legible en el .env (ej: "Unidad").
+            unit:            accountTemplate?.unit ?? env.ALEGRA_UNIT_OF_MEASURE,
             initialQuantity: variant.inventory_quantity,
             unitCost:        cost > 0 ? cost : undefined,
             minQuantity:     0,
@@ -577,10 +613,11 @@ class OrchestratorCore {
               initialQuantity: variant.inventory_quantity,
             }],
           },
-          price:    [{ idPriceList: 1, price }],
+          price:    [{ idPriceList: (accountTemplate?.priceListId ?? 1) as number | string, price }],
           itemType: 'product',
         };
 
+        logger.info(`[Debug] Payload enviado a Alegra para SKU ${variant.sku}: ${JSON.stringify(payload)}`);
         const alegraItem = await alegraConnector.createItem(payload);
 
         // ── Insertar en product_catalog ───────────────────────────────────

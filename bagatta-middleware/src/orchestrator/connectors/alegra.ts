@@ -59,6 +59,23 @@ class AlegraConnector {
     return data as AlegraItem;
   }
 
+  /**
+   * Devuelve el primer ítem activo de Alegra con sus cuentas contables.
+   * Usado en el bootstrap para obtener la plantilla de cuentas (error 1008).
+   */
+  async getFirstActiveItem(): Promise<Record<string, unknown> | null> {
+    const { data } = await this.client.get('/items', {
+      params: {
+        limit:  1,
+        start:  0,
+        type:   'product',
+        fields: 'id,name,inventoryAccount,saleCost,saleIncome,tax,status',
+      },
+    });
+    const items = Array.isArray(data) ? data as Record<string, unknown>[] : [];
+    return items.find((it) => it['status'] === 'active') ?? items[0] ?? null;
+  }
+
   async getSyncedItems(): Promise<AlegraItem[]> {
     const { categoryId } = getAlegraIds();
     const allItems: AlegraItem[] = [];

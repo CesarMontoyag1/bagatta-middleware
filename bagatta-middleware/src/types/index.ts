@@ -135,7 +135,16 @@ export interface AlegraItem {
 export interface AlegraItemCreatePayload {
   name: string;
   reference: string;
-  category: { id: number | string };
+  // itemCategory → categoría comercial (clasificación de inventario)
+  itemCategory?: { id: number | string };
+  // category → cuenta contable de ingresos por ventas
+  category?: { id: number | string };
+  // accounting → IDs como strings simples (no objetos { id })
+  accounting?: {
+    inventory?:             string;  // cuenta de inventario
+    inventariablePurchase?: string;  // cuenta costo de ventas
+  };
+  tax?: Array<{ id: string | number }>;
   inventory: {
     unit: string;
     initialQuantity: number;
@@ -143,7 +152,7 @@ export interface AlegraItemCreatePayload {
     minQuantity: number;
     warehouses: Array<{ id: number | string; initialQuantity: number }>;
   };
-  price: Array<{ idPriceList: number; price: number }>;
+  price: Array<{ idPriceList: number | string; price: number }>;
   itemType: 'product';
 }
 

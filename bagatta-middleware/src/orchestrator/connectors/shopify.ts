@@ -170,6 +170,15 @@ class ShopifyConnector {
     return data.variant.inventory_item_id as number;
   }
 
+  async getVariant(variantId: string): Promise<{ inventory_item_id: number; inventory_management: string | null }> {
+    this.assertTokenValid();
+    const { data } = await this.getClient().get(`/variants/${variantId}.json`);
+    return {
+      inventory_item_id:    data.variant.inventory_item_id as number,
+      inventory_management: (data.variant.inventory_management as string | null) ?? null,
+    };
+  }
+
   private extractNextPageInfo(linkHeader?: string): string | undefined {
     if (!linkHeader) return undefined;
     const match = linkHeader.match(/<[^>]*[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"/);
