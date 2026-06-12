@@ -70,6 +70,26 @@ class OrchestratorCore {
         // No abortar — continuar con el ciclo de reconciliación normal
       }
 
+      // ── Detectar y reparar registros huérfanos en product_catalog ─────────
+      // Si master_inventory fue borrado manualmente, o el ítem en Alegra fue
+      // eliminado fuera del middleware, el catalog queda en estado huérfano:
+      // el sistema "cree" que el SKU está sincronizado pero una o ambas puntas
+      // ya no existen. Esto detecta esos casos y repara recreando lo que falte.
+      try {
+        const orphanReport = await this.reconcileOrphans();
+        if (orphanReport.repaired > 0 || orphanReport.errors.length > 0) {
+          logger.info(
+              `Orphan reconcile: ${orphanReport.repaired} reparado(s), ` +
+              `${orphanReport.errors.length} error(es)`,
+          );
+          result.errors.push(...orphanReport.errors);
+        }
+      } catch (err) {
+        const msg = `Error en reconciliación de huérfanos: ${(err as Error).message}`;
+        logger.warn(msg);
+        result.errors.push(msg);
+      }
+
       // ── Obtener todos los SKUs sincronizados activos ───────────────────────
       const catalog = await prisma.productCatalog.findMany({
         where:   { status: 'active' },
@@ -155,8 +175,15 @@ class OrchestratorCore {
     const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
 
     // ── 2. Calcular deltas REALES (no snapshot comparison) ────────────────
-    // RF-03: si ambas plataformas vendieron, capturamos ambos deltas independientemente
-    const deltaShopify = master.stockShopifyLast - currentShopify;
+    // RF-03: si ambas plataformas vendieron, capturamos ambos deltas independientemente.
+    //
+    // IMPORTANTE: si inventory_management !== 'shopify', Shopify no controla el stock
+    // de esta variante y getInventoryLevel devuelve 0 siempre — lo que generaría un
+    // falso delta igual al stockShopifyLast en cada ciclo. En ese caso ignoramos el
+    // delta de Shopify y solo procesamos el de Alegra.
+    const deltaShopify = shopifyTracking === 'shopify'
+        ? master.stockShopifyLast - currentShopify
+        : 0; // sin tracking → sin delta real en Shopify
     const deltaAlegra  = master.stockAlegraLast  - currentAlegra;
     const hasStockChange = deltaShopify !== 0 || deltaAlegra !== 0;
 
@@ -175,7 +202,10 @@ class OrchestratorCore {
         where: { sku },
         data:  {
           stockGlobal:      newGlobal,
-          stockShopifyLast: newGlobal,
+          // Solo actualizar stockShopifyLast si hay tracking real.
+          // Sin tracking, Shopify siempre reporta 0 → no actualizar _last para
+          // evitar que el siguiente ciclo calcule un falso delta de tamaño newGlobal.
+          stockShopifyLast: shopifyTracking === 'shopify' ? newGlobal : master.stockShopifyLast,
           stockAlegraLast:  newGlobal,
           lastUpdated:      new Date(),
           lastUpdatedBy:    'orchestrator',
@@ -352,32 +382,42 @@ class OrchestratorCore {
           const alegraItem     = await alegraConnector.getItem(alegraItemId);
           const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
 
-          // Calcular deltas reales acumulados durante el downtime
-          const deltaShopify = master.stockShopifyLast - currentShopify;
-          const deltaAlegra  = master.stockAlegraLast  - currentAlegra;
+          // Calcular deltas reales acumulados durante el downtime.
+          // Si inventory_management !== 'shopify', Shopify devuelve 0 siempre → ignorar delta.
+          const deltaShopifyCatchup = shopifyTracking === 'shopify'
+              ? master.stockShopifyLast - currentShopify
+              : 0;
+          const deltaAlegraCatchup  = master.stockAlegraLast  - currentAlegra;
 
-          if (deltaShopify === 0 && deltaAlegra === 0) continue; // sin cambios
+          if (deltaShopifyCatchup === 0 && deltaAlegraCatchup === 0) continue; // sin cambios
 
           const oldGlobal = master.stockGlobal;
-          const newGlobal = Math.max(0, oldGlobal - deltaShopify - deltaAlegra);
+          const newGlobal = Math.max(0, oldGlobal - deltaShopifyCatchup - deltaAlegraCatchup);
 
           logger.info(
               `Catchup SKU ${sku}: master=${oldGlobal}, ` +
-              `Δshopify=${deltaShopify}, Δalegra=${deltaAlegra} → nuevo=${newGlobal}`,
+              `Δshopify=${deltaShopifyCatchup}, Δalegra=${deltaAlegraCatchup} → nuevo=${newGlobal}`,
           );
 
           await prisma.masterInventory.update({
             where: { sku },
             data:  {
               stockGlobal:      newGlobal,
-              stockShopifyLast: newGlobal,
+              stockShopifyLast: shopifyTracking === 'shopify' ? newGlobal : master.stockShopifyLast,
               stockAlegraLast:  newGlobal,
               lastUpdatedBy:    'catchup_sync',
             },
           });
 
-          // Propagar a Shopify
-          await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+          // Solo propagar a Shopify si tiene tracking activado
+          if (shopifyTracking === 'shopify') {
+            await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+          } else {
+            logger.debug(
+                `Catchup SKU ${sku}: omitiendo setInventoryLevel (inventory_management="${shopifyTracking ?? 'null'}"). ` +
+                `Activa "Track quantity" en Shopify para sincronización bidireccional.`,
+            );
+          }
 
           // Propagar a Alegra (ajuste relativo al stock actual)
           const adjustQty = newGlobal - currentAlegra;
@@ -618,7 +658,45 @@ class OrchestratorCore {
         };
 
         logger.info(`[Debug] Payload enviado a Alegra para SKU ${variant.sku}: ${JSON.stringify(payload)}`);
-        const alegraItem = await alegraConnector.createItem(payload);
+
+        // ── Crear ítem en Alegra, con recuperación si la Referencia ya existe ──
+        // Código 1009 = "La referencia X ya ha sido asignada a otro ítem".
+        // Esto ocurre cuando product_catalog se vació (ej: tras una migración o
+        // reset de BD) pero el ítem de Alegra de una corrida anterior sigue
+        // existiendo. En ese caso, en lugar de fallar, buscamos el ítem
+        // existente por reference y vinculamos product_catalog a él —
+        // sin crear un duplicado ni perder el stock/historial ya presente en Alegra.
+        let alegraItem;
+        let linkedToExisting = false;
+
+        try {
+          alegraItem = await alegraConnector.createItem(payload);
+        } catch (createErr) {
+          const errData = (createErr as { response?: { data?: { code?: number; message?: string } } }).response?.data;
+
+          if (errData?.code === 1009) {
+            logger.warn(
+                `Alegra: referencia "${variant.sku}" ya existe. Buscando ítem existente para vincular...`,
+            );
+
+            const existingItem = await alegraConnector.findItemByReference(variant.sku);
+
+            if (!existingItem) {
+              // No deberíamos llegar aquí (Alegra dice que existe pero la búsqueda no lo encuentra)
+              throw createErr;
+            }
+
+            alegraItem      = existingItem;
+            linkedToExisting = true;
+
+            logger.info(
+                `Alegra: vinculando SKU ${variant.sku} al ítem existente id=${existingItem.id} ` +
+                `(stock actual en Alegra: ${existingItem.inventory?.availableQuantity ?? 0})`,
+            );
+          } else {
+            throw createErr;
+          }
+        }
 
         // ── Insertar en product_catalog ───────────────────────────────────
         await prisma.productCatalog.create({
@@ -637,12 +715,19 @@ class OrchestratorCore {
         });
 
         // ── Insertar en master_inventory ──────────────────────────────────
+        // Si vinculamos a un ítem existente, usar el stock REAL que ya tiene
+        // en Alegra (no el de Shopify) para no sobreescribir lo existente.
+        // El siguiente ciclo de reconcileSku calculará el delta correcto.
+        const initialStock = linkedToExisting
+            ? (alegraItem.inventory?.availableQuantity ?? 0)
+            : variant.inventory_quantity;
+
         await prisma.masterInventory.create({
           data: {
             sku:              variant.sku,
-            stockGlobal:      variant.inventory_quantity,
-            stockShopifyLast: variant.inventory_quantity,
-            stockAlegraLast:  variant.inventory_quantity,
+            stockGlobal:      initialStock,
+            stockShopifyLast: linkedToExisting ? 0 : variant.inventory_quantity,
+            stockAlegraLast:  initialStock,
             lastUpdatedBy:    'orchestrator',
           },
         });
@@ -657,13 +742,27 @@ class OrchestratorCore {
           sku:            variant.sku,
           fieldChanged:   'status',
           oldValue:       null,
-          newValue:       'active',
+          newValue:       linkedToExisting ? 'linked_existing' : 'active',
           origin:         'shopify_webhook',
           sourceEventRef: `shopify_product_${shopifyProduct.id}`,
+          alertTriggered: linkedToExisting,
         });
 
+        if (linkedToExisting) {
+          await auditService.createAlert({
+            type:   'orphan_repaired',
+            sku:    variant.sku,
+            detail: `product_catalog no tenía registro para SKU ${variant.sku}, pero ya existía ` +
+                `como ítem ${alegraItem.id} en Alegra (stock=${initialStock}). ` +
+                `Se vinculó al ítem existente en lugar de crear uno nuevo. ` +
+                `Verifica que el stock_global sea correcto.`,
+          });
+        }
+
         logger.info(
-            `✅  SKU ${variant.sku} sincronizado: Shopify variant ${variant.id} ↔ Alegra item ${alegraItem.id}`,
+            linkedToExisting
+                ? `✅  SKU ${variant.sku} vinculado a ítem Alegra existente ${alegraItem.id} (Shopify variant ${variant.id})`
+                : `✅  SKU ${variant.sku} sincronizado: Shopify variant ${variant.id} ↔ Alegra item ${alegraItem.id}`,
         );
 
       } catch (err) {
@@ -926,6 +1025,297 @@ class OrchestratorCore {
     }
 
     logger.info(`Producto ${shopifyProductId} eliminado: ${variants.length} variante(s) archivada(s)`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  RECONCILE ORPHANS
+  //  Detecta product_catalog activos cuya contraparte ya no existe:
+  //    - master_inventory faltante (borrado manualmente de la BD)
+  //    - alegraItemId apuntando a un ítem borrado en Alegra (404 / NOT_FOUND)
+  //
+  //  Repara cada caso de forma independiente:
+  //    - master_inventory faltante → se recrea leyendo el stock real de Shopify
+  //    - ítem de Alegra inexistente → se re-crea en Alegra reutilizando el
+  //      mismo flujo de creación (mismo payload que un producto nuevo),
+  //      y se actualiza alegraItemId en product_catalog con el nuevo ID.
+  //
+  //  Es idempotente y se ejecuta en cada ciclo — si todo está sano, no hace nada.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async reconcileOrphans(): Promise<{ repaired: number; errors: string[] }> {
+    const errors: string[] = [];
+    let repaired = 0;
+
+    const catalog = await prisma.productCatalog.findMany({
+      where:   { status: 'active' },
+      include: { inventory: true },
+    });
+
+    for (const entry of catalog) {
+      // ── Caso 1: master_inventory faltante ─────────────────────────────────
+      if (!entry.inventory) {
+        try {
+          logger.warn(
+              `Orphan: SKU ${entry.sku} no tiene master_inventory. Recreando desde la realidad...`,
+          );
+
+          let stockReal = 0;
+          try {
+            const variantData = await shopifyConnector.getVariant(entry.shopifyVariantId);
+            if (variantData.inventory_management === 'shopify') {
+              await shopifyConnector.connectInventoryLevel(variantData.inventory_item_id);
+              stockReal = await shopifyConnector.getInventoryLevel(variantData.inventory_item_id);
+            }
+          } catch (err) {
+            logger.warn(`Orphan: no se pudo leer stock de Shopify para ${entry.sku}: ${(err as Error).message}`);
+          }
+
+          // Si Shopify no reporta nada útil, intentar leer de Alegra como respaldo
+          if (stockReal === 0) {
+            try {
+              const alegraItem = await alegraConnector.getItem(entry.alegraItemId);
+              stockReal = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
+            } catch {
+              // Si Alegra tampoco responde, se maneja en el Caso 2 más abajo
+            }
+          }
+
+          await prisma.masterInventory.create({
+            data: {
+              sku:              entry.sku,
+              stockGlobal:      stockReal,
+              stockShopifyLast: stockReal,
+              stockAlegraLast:  stockReal,
+              lastUpdatedBy:    'orchestrator',
+            },
+          });
+
+          await auditService.log({
+            idempotencyKey: buildIdempotencyKey('orchestrator', `orphan_repair_inventory_${entry.sku}_${Date.now()}`, 'status'),
+            sku:            entry.sku,
+            fieldChanged:   'status',
+            oldValue:       'missing_master_inventory',
+            newValue:       String(stockReal),
+            origin:         'orchestrator',
+            sourceEventRef: 'reconcile_orphans',
+            alertTriggered: true,
+          });
+
+          await auditService.createAlert({
+            type:   'orphan_repaired',
+            sku:    entry.sku,
+            detail: `master_inventory faltante para SKU ${entry.sku}. Recreado con stock=${stockReal} ` +
+                `leído desde ${stockReal > 0 ? 'la plataforma real' : 'valor por defecto 0'}. ` +
+                `Verifica que el stock sea correcto.`,
+          });
+
+          repaired++;
+          logger.info(`Orphan: master_inventory recreado para SKU ${entry.sku} con stock=${stockReal}`);
+
+          // Refrescar entry.inventory para el Caso 2 (evita doble-fetch)
+          entry.inventory = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
+        } catch (err) {
+          const msg = `Orphan: error recreando master_inventory para ${entry.sku}: ${(err as Error).message}`;
+          logger.error(msg);
+          errors.push(msg);
+          continue; // No intentar el Caso 2 si esto falló
+        }
+      }
+
+      // ── Caso 2: el ítem de Alegra ya no existe (fue borrado externamente) ──
+      try {
+        await alegraConnector.getItem(entry.alegraItemId);
+        // Si no lanza, el ítem existe — todo OK, no hacer nada
+      } catch (err) {
+        const status = (err as { response?: { status?: number } }).response?.status;
+        const isNotFound = status === 404 || status === 400; // Alegra devuelve 400 para IDs inexistentes en algunos casos
+
+        if (!isNotFound) {
+          // Error de red/temporal — no es un huérfano, no reparar agresivamente
+          const msg = `Orphan: error verificando ítem Alegra ${entry.alegraItemId} (SKU ${entry.sku}): ${(err as Error).message}`;
+          logger.warn(msg);
+          continue;
+        }
+
+        try {
+          logger.warn(
+              `Orphan: ítem Alegra ${entry.alegraItemId} (SKU ${entry.sku}) no existe. Recreando en Alegra...`,
+          );
+
+          const oldAlegraItemId = entry.alegraItemId;
+          const newAlegraItemId = await this.recreateAlegraItem(entry);
+
+          await prisma.productCatalog.update({
+            where: { sku: entry.sku },
+            data:  { alegraItemId: newAlegraItemId },
+          });
+
+          await auditService.log({
+            idempotencyKey: buildIdempotencyKey('orchestrator', `orphan_repair_alegra_${entry.sku}_${Date.now()}`, 'status'),
+            sku:            entry.sku,
+            fieldChanged:   'status',
+            oldValue:       `alegra_item_${oldAlegraItemId}_missing`,
+            newValue:       `alegra_item_${newAlegraItemId}`,
+            origin:         'orchestrator',
+            sourceEventRef: 'reconcile_orphans',
+            alertTriggered: true,
+          });
+
+          await auditService.createAlert({
+            type:   'orphan_repaired',
+            sku:    entry.sku,
+            detail: `Ítem de Alegra ${oldAlegraItemId} (SKU ${entry.sku}) no existía. ` +
+                `Recreado como ítem ${newAlegraItemId} con el stock actual de master_inventory. ` +
+                `Verifica que la información contable sea correcta.`,
+          });
+
+          repaired++;
+          logger.info(`Orphan: ítem Alegra recreado para SKU ${entry.sku} → nuevo id=${newAlegraItemId}`);
+        } catch (recreateErr) {
+          const msg = `Orphan: error recreando ítem Alegra para ${entry.sku}: ${(recreateErr as Error).message}`;
+          logger.error(msg);
+          errors.push(msg);
+        }
+      }
+    }
+
+    return { repaired, errors };
+  }
+
+  /**
+   * Recrea un ítem en Alegra para un SKU cuyo ítem original fue borrado.
+   * Usa el stock actual de master_inventory y los last_known_* de product_catalog
+   * (precio, costo, nombre) — no depende de Shopify para estos valores porque
+   * ya están cacheados localmente.
+   * Devuelve el nuevo alegraItemId.
+   */
+  private async recreateAlegraItem(entry: {
+    sku:              string;
+    lastKnownName:    string;
+    lastKnownPrice:   { toNumber(): number };
+    lastKnownCost:    { toNumber(): number };
+    inventory:        { stockGlobal: number } | null;
+  }): Promise<string> {
+    const { categoryId, warehouseId, accountTemplate } = getAlegraIds();
+    const stock = entry.inventory?.stockGlobal ?? 0;
+    const price = entry.lastKnownPrice.toNumber();
+    const cost  = entry.lastKnownCost.toNumber();
+
+    const accountingBlock = accountTemplate ? {
+      ...(accountTemplate.inventoryAccount && { inventory:             String(accountTemplate.inventoryAccount.id) }),
+      ...(accountTemplate.saleCost         && { inventariablePurchase: String(accountTemplate.saleCost.id) }),
+    } : undefined;
+
+    const payload: AlegraItemCreatePayload = {
+      name:      entry.lastKnownName,
+      reference: entry.sku,
+      itemCategory: { id: categoryId },
+      ...(accountTemplate?.saleIncome && { category: { id: String(accountTemplate.saleIncome.id) } }),
+      ...(accountingBlock && Object.keys(accountingBlock).length > 0 && { accounting: accountingBlock }),
+      ...(accountTemplate?.tax && { tax: [{ id: String(accountTemplate.tax.id) }] }),
+      inventory: {
+        unit:            accountTemplate?.unit ?? env.ALEGRA_UNIT_OF_MEASURE,
+        initialQuantity: stock,
+        unitCost:        cost > 0 ? cost : undefined,
+        minQuantity:     0,
+        warehouses: [{ id: warehouseId, initialQuantity: stock }],
+      },
+      price:    [{ idPriceList: (accountTemplate?.priceListId ?? 1) as number | string, price }],
+      itemType: 'product',
+    };
+
+    const alegraItem = await alegraConnector.createItem(payload);
+    return String(alegraItem.id);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  RESET MASTER FROM REALITY
+  //  Resincroniza master_inventory con el stock REAL actual de ambas plataformas.
+  //  Usar cuando los _last están desincronizados (ej: tras activar tracking,
+  //  tras errores de creación, o tras una migración manual de datos).
+  //  No genera delta — solo alinea el estado conocido con la realidad.
+  // ═══════════════════════════════════════════════════════════════════════════
+  async resetMasterFromReality(sku?: string): Promise<{
+    skusReset: number;
+    results: Array<{ sku: string; shopify: number; alegra: string; newGlobal: number; tracking: string }>;
+  }> {
+    const whereClause = sku
+        ? { sku, status: 'active' as const }
+        : { status: 'active' as const };
+
+    const catalog = await prisma.productCatalog.findMany({
+      where:   whereClause,
+      include: { inventory: true },
+    });
+
+    const results: Array<{ sku: string; shopify: number; alegra: string; newGlobal: number; tracking: string }> = [];
+
+    for (const entry of catalog) {
+      try {
+        const variantData            = await shopifyConnector.getVariant(entry.shopifyVariantId);
+        const shopifyInventoryItemId = variantData.inventory_item_id;
+        const shopifyTracking        = variantData.inventory_management;
+
+        // Si tiene tracking, conectar primero a la location (en caso de que no esté)
+        if (shopifyTracking === 'shopify') {
+          await shopifyConnector.connectInventoryLevel(shopifyInventoryItemId);
+        }
+
+        const currentShopify = shopifyTracking === 'shopify'
+            ? await shopifyConnector.getInventoryLevel(shopifyInventoryItemId)
+            : entry.inventory?.stockGlobal ?? 0;
+
+        const alegraItem    = await alegraConnector.getItem(entry.alegraItemId);
+        const currentAlegra = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
+
+        // El nuevo global es el máximo de lo que ambas plataformas reportan.
+        // No restamos nada — solo alineamos el estado conocido.
+        const newGlobal = shopifyTracking === 'shopify'
+            ? Math.max(currentShopify, currentAlegra)
+            : currentAlegra;
+
+        await prisma.masterInventory.update({
+          where: { sku: entry.sku },
+          data: {
+            stockGlobal:      newGlobal,
+            stockShopifyLast: shopifyTracking === 'shopify' ? currentShopify : newGlobal,
+            stockAlegraLast:  currentAlegra,
+            lastUpdatedBy:    'manual_reset',
+          },
+        });
+
+        // Si Shopify tiene tracking y el stock difiere → sincronizar
+        if (shopifyTracking === 'shopify' && currentShopify !== newGlobal) {
+          await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+        }
+
+        // Si Alegra difiere → ajustar
+        if (currentAlegra !== newGlobal) {
+          const adjustQty = newGlobal - currentAlegra;
+          await alegraConnector.adjustStock(
+              entry.alegraItemId,
+              adjustQty,
+              `Reset manual desde realidad — stock ajustado a ${newGlobal}`,
+          );
+        }
+
+        results.push({
+          sku:       entry.sku,
+          shopify:   currentShopify,
+          alegra:    String(currentAlegra),
+          newGlobal,
+          tracking:  shopifyTracking ?? 'none',
+        });
+
+        logger.info(
+            `Reset SKU ${entry.sku}: shopify=${currentShopify} alegra=${currentAlegra} → global=${newGlobal} (tracking=${shopifyTracking ?? 'none'})`,
+        );
+      } catch (err) {
+        logger.error(`Reset: error en SKU ${entry.sku}:`, err);
+        results.push({ sku: entry.sku, shopify: -1, alegra: 'error', newGlobal: -1, tracking: 'error' });
+      }
+    }
+
+    return { skusReset: results.filter(r => r.newGlobal >= 0).length, results };
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

@@ -91,14 +91,71 @@ class ShopifyConnector {
     return level?.available ?? 0;
   }
 
+  /**
+   * Conecta un inventory_item a la location configurada.
+   * Requerido antes de poder hacer set/adjust cuando el tracking acaba de activarse
+   * o cuando el item nunca estuvo asociado a esa location.
+   * Es idempotente — si ya está conectado, Shopify devuelve el nivel existente.
+   */
+  async connectInventoryLevel(inventoryItemId: number): Promise<void> {
+    this.assertTokenValid();
+    try {
+      await this.getClient().post('/inventory_levels/connect.json', {
+        location_id:       parseInt(LOCATION_ID, 10),
+        inventory_item_id: inventoryItemId,
+        relocate_if_necessary: false,
+      });
+      logger.info(`Shopify: inventory_item ${inventoryItemId} conectado a location ${LOCATION_ID}`);
+    } catch (err) {
+      const status = (err as { response?: { status?: number } }).response?.status;
+      // 422 = ya estaba conectado — no es un error real
+      if (status === 422) {
+        logger.debug(`Shopify: inventory_item ${inventoryItemId} ya estaba conectado a location ${LOCATION_ID}`);
+        return;
+      }
+      // 404 = el inventory_item_id no existe en absoluto (variante eliminada,
+      // o el ID que se tenía cacheado ya no es válido). No es recuperable aquí
+      // — quien llama debe manejar el caso de "sin stock disponible".
+      if (status === 404) {
+        logger.warn(
+            `Shopify: inventory_item ${inventoryItemId} no existe (404) al intentar conectar a location ${LOCATION_ID}.`,
+        );
+        return;
+      }
+      throw err;
+    }
+  }
+
   async setInventoryLevel(inventoryItemId: number, quantity: number): Promise<void> {
     this.assertTokenValid();
-    await this.getClient().post('/inventory_levels/set.json', {
-      location_id: parseInt(LOCATION_ID, 10),
-      inventory_item_id: inventoryItemId,
-      available: quantity,
-    });
-    logger.debug(`Shopify: inventory_item ${inventoryItemId} → ${quantity}`);
+    try {
+      await this.getClient().post('/inventory_levels/set.json', {
+        location_id:       parseInt(LOCATION_ID, 10),
+        inventory_item_id: inventoryItemId,
+        available:         quantity,
+      });
+      logger.debug(`Shopify: inventory_item ${inventoryItemId} → ${quantity}`);
+    } catch (err) {
+      const status = (err as { response?: { status?: number } }).response?.status;
+      // 404 = el item no está conectado a esta location todavía
+      // Conectar y reintentar automáticamente
+      if (status === 404) {
+        logger.warn(
+            `Shopify: inventory_item ${inventoryItemId} no conectado a location ${LOCATION_ID}. ` +
+            `Conectando y reintentando...`,
+        );
+        await this.connectInventoryLevel(inventoryItemId);
+        // Reintentar el set tras conectar
+        await this.getClient().post('/inventory_levels/set.json', {
+          location_id:       parseInt(LOCATION_ID, 10),
+          inventory_item_id: inventoryItemId,
+          available:         quantity,
+        });
+        logger.info(`Shopify: inventory_item ${inventoryItemId} → ${quantity} (tras reconexión)`);
+        return;
+      }
+      throw err;
+    }
   }
 
   async updateVariantPrice(variantId: string, price: string): Promise<void> {

@@ -60,6 +60,20 @@ class AlegraConnector {
   }
 
   /**
+   * Busca un ítem por su campo `reference` (= SKU de Shopify).
+   * Usado para recuperar la vinculación cuando product_catalog se vació
+   * pero el ítem ya existe en Alegra (Alegra rechaza referencias duplicadas).
+   * Devuelve null si no se encuentra ninguno.
+   */
+  async findItemByReference(reference: string): Promise<AlegraItem | null> {
+    const { data } = await this.client.get('/items', {
+      params: { reference, limit: 1 },
+    });
+    const items = data as AlegraItem[];
+    return items.length > 0 ? items[0] : null;
+  }
+
+  /**
    * Devuelve el primer ítem activo de Alegra con sus cuentas contables.
    * Usado en el bootstrap para obtener la plantilla de cuentas (error 1008).
    */

@@ -291,4 +291,5 @@ enum AlertType {
   webhook_hmac_failure
   sku_missing
   catchup_completed
+  orphan_repaired
 }
