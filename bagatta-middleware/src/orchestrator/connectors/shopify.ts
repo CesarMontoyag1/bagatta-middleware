@@ -3,29 +3,25 @@ import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { ShopifyProduct, ShopifyInventoryLevel } from '../../types';
 import { shopifyTokenManager } from './shopify-auth';
-
-/**
- * Normaliza el SHOPIFY_LOCATION_ID.
- * Acepta formato GID GraphQL (gid://shopify/Location/118506684576)
- * y formato numérico simple (118506684576).
- * La REST API requiere solo el número.
- */
-function normalizeLocationId(raw: string): string {
-  if (raw.startsWith('gid://')) {
-    const parts = raw.split('/');
-    return parts[parts.length - 1];
-  }
-  return raw;
-}
-
-const LOCATION_ID = normalizeLocationId(env.SHOPIFY_LOCATION_ID);
+import { getShopifyLocationId } from '../../services/shopifyBootstrap';
 
 class ShopifyConnector {
   private baseURL: string;
 
   constructor() {
     this.baseURL = `https://${env.SHOPIFY_SHOP_DOMAIN}/admin/api/${env.SHOPIFY_API_VERSION}`;
-    logger.info(`Shopify connector: ${this.baseURL} | Location: ${LOCATION_ID}`);
+    logger.info(`Shopify connector: ${this.baseURL}`);
+  }
+
+  /**
+   * Lista todas las locations de la tienda.
+   * Usado por shopifyBootstrap para resolver el location_id automáticamente.
+   * No depende de getShopifyLocationId() — rompe el ciclo de inicialización.
+   */
+  async listLocations(): Promise<Array<{ id: number; name: string; active: boolean }>> {
+    this.assertTokenValid();
+    const { data } = await this.getClient().get('/locations.json');
+    return (data.locations ?? []) as Array<{ id: number; name: string; active: boolean }>;
   }
 
   private getClient(): AxiosInstance {
@@ -82,13 +78,50 @@ class ShopifyConnector {
     return data.products as ShopifyProduct[];
   }
 
+  /**
+   * Obtiene el stock disponible de un inventory_item en la location configurada.
+   * Si no encuentra nivel en esa location, busca en TODAS las locations y
+   * actualiza el bootstrap con el location_id correcto automáticamente.
+   */
   async getInventoryLevel(inventoryItemId: number): Promise<number> {
     this.assertTokenValid();
+    const locationId = getShopifyLocationId();
     const { data } = await this.getClient().get('/inventory_levels.json', {
-      params: { inventory_item_ids: inventoryItemId, location_ids: LOCATION_ID },
+      params: { inventory_item_ids: inventoryItemId, location_ids: locationId },
     });
-    const level = (data.inventory_levels as ShopifyInventoryLevel[])[0];
-    return level?.available ?? 0;
+    const levels = data.inventory_levels as ShopifyInventoryLevel[];
+
+    if (levels.length > 0) {
+      return levels[0].available;
+    }
+
+    // No hay nivel en la location configurada — buscar en todas las locations
+    const { data: allData } = await this.getClient().get('/inventory_levels.json', {
+      params: { inventory_item_ids: inventoryItemId },
+    });
+    const allLevels = allData.inventory_levels as ShopifyInventoryLevel[];
+
+    if (allLevels.length === 0) {
+      logger.warn(`Shopify: inventory_item ${inventoryItemId} sin niveles en ninguna location`);
+      return 0;
+    }
+
+    // Tomar el nivel con mayor stock disponible (más probable que sea el correcto)
+    const best = allLevels.reduce((a, b) => a.available >= b.available ? a : b);
+
+    logger.warn(
+        `Shopify: inventory_item ${inventoryItemId} no encontrado en location ${locationId}. ` +
+        `Usando location ${best.location_id} con available=${best.available}. ` +
+        `Actualiza SHOPIFY_LOCATION_ID="${best.location_id}" en el .env.`,
+    );
+
+    // Auto-corregir el location_id en memoria para este ciclo y los siguientes
+    if (best.available > 0) {
+      const { overrideShopifyLocationId } = await import('../../services/shopifyBootstrap');
+      overrideShopifyLocationId(String(best.location_id));
+    }
+
+    return best.available;
   }
 
   /**
@@ -101,16 +134,16 @@ class ShopifyConnector {
     this.assertTokenValid();
     try {
       await this.getClient().post('/inventory_levels/connect.json', {
-        location_id:       parseInt(LOCATION_ID, 10),
+        location_id:       parseInt(getShopifyLocationId(), 10),
         inventory_item_id: inventoryItemId,
         relocate_if_necessary: false,
       });
-      logger.info(`Shopify: inventory_item ${inventoryItemId} conectado a location ${LOCATION_ID}`);
+      logger.info(`Shopify: inventory_item ${inventoryItemId} conectado a location ${getShopifyLocationId()}`);
     } catch (err) {
       const status = (err as { response?: { status?: number } }).response?.status;
       // 422 = ya estaba conectado — no es un error real
       if (status === 422) {
-        logger.debug(`Shopify: inventory_item ${inventoryItemId} ya estaba conectado a location ${LOCATION_ID}`);
+        logger.debug(`Shopify: inventory_item ${inventoryItemId} ya estaba conectado a location ${getShopifyLocationId()}`);
         return;
       }
       // 404 = el inventory_item_id no existe en absoluto (variante eliminada,
@@ -118,7 +151,7 @@ class ShopifyConnector {
       // — quien llama debe manejar el caso de "sin stock disponible".
       if (status === 404) {
         logger.warn(
-            `Shopify: inventory_item ${inventoryItemId} no existe (404) al intentar conectar a location ${LOCATION_ID}.`,
+            `Shopify: inventory_item ${inventoryItemId} no existe (404) al intentar conectar a location ${getShopifyLocationId()}.`,
         );
         return;
       }
@@ -130,7 +163,7 @@ class ShopifyConnector {
     this.assertTokenValid();
     try {
       await this.getClient().post('/inventory_levels/set.json', {
-        location_id:       parseInt(LOCATION_ID, 10),
+        location_id:       parseInt(getShopifyLocationId(), 10),
         inventory_item_id: inventoryItemId,
         available:         quantity,
       });
@@ -141,13 +174,13 @@ class ShopifyConnector {
       // Conectar y reintentar automáticamente
       if (status === 404) {
         logger.warn(
-            `Shopify: inventory_item ${inventoryItemId} no conectado a location ${LOCATION_ID}. ` +
+            `Shopify: inventory_item ${inventoryItemId} no conectado a location ${getShopifyLocationId()}. ` +
             `Conectando y reintentando...`,
         );
         await this.connectInventoryLevel(inventoryItemId);
         // Reintentar el set tras conectar
         await this.getClient().post('/inventory_levels/set.json', {
-          location_id:       parseInt(LOCATION_ID, 10),
+          location_id:       parseInt(getShopifyLocationId(), 10),
           inventory_item_id: inventoryItemId,
           available:         quantity,
         });

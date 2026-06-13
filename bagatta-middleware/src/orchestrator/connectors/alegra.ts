@@ -116,18 +116,46 @@ class AlegraConnector {
     return allItems;
   }
 
-  async adjustStock(alegraItemId: string, quantity: number, reason: string): Promise<void> {
-    const { warehouseId } = getAlegraIds();
+  /**
+   * Ajusta el stock de un ítem en Alegra mediante un inventory-adjustment.
+   *
+   * Alegra requiere el campo `type` para distinguir entrada vs salida:
+   *   - type: "positive" → ENTRADA de inventario (quantity debe ser positivo)
+   *   - type: "negative" → SALIDA de inventario (quantity debe ser positivo también,
+   *                          el signo lo da el `type`, no el número)
+   *
+   * `delta` aquí puede ser positivo o negativo según la dirección del cambio
+   * calculado por el orquestador. Esta función traduce ese delta al formato
+   * que Alegra espera: type correcto + quantity siempre positivo (valor absoluto).
+   *
+   * Si delta === 0 no hace nada (no se debe llamar, pero por seguridad no falla).
+   */
+  async adjustStock(alegraItemId: string, delta: number, reason: string): Promise<void> {
+    if (delta === 0) {
+      logger.debug(`Alegra: adjustStock con delta=0 para ítem ${alegraItemId}. Omitido.`);
+      return;
+    }
 
-    await this.client.post('/inventory-adjustments', {
+    const { warehouseId } = getAlegraIds();
+    const type     = delta > 0 ? 'positive' : 'negative';
+    const quantity = Math.abs(delta);
+
+    const payload = {
       date:        new Date().toISOString().split('T')[0],
       description: reason,
       warehouse:   { id: warehouseId },
-      inventoryItems: [
-        { item: { id: alegraItemId }, quantity, unitCost: 0 },
+      items: [
+        { item: { id: alegraItemId }, type, quantity },
       ],
-    });
-    logger.debug(`Alegra: ajuste inventario ítem ${alegraItemId} → qty_delta=${quantity}`);
+    };
+
+    logger.debug(`Alegra adjustStock payload: ${JSON.stringify(payload)}`);
+
+    const { data } = await this.client.post('/inventory-adjustments', payload);
+    logger.info(
+        `Alegra: ajuste inventario ítem ${alegraItemId} → ${type} ${quantity} (delta=${delta}) | ` +
+        `Respuesta id=${data?.id ?? 'N/A'}`,
+    );
   }
 
   async updateItemPrice(alegraItemId: string, price: number): Promise<void> {

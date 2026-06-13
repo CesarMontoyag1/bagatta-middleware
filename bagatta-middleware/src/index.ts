@@ -5,6 +5,7 @@ import { startScheduler } from './cron/scheduler';
 import { logger } from './utils/logger';
 import { env } from './config/env';
 import { bootstrapAlegraIds } from './services/alegraBootstrap';
+import { bootstrapShopifyIds } from './services/shopifyBootstrap';
 
 async function bootstrap(): Promise<void> {
   logger.info('🚀  Bagatta Middleware arrancando...');
@@ -21,6 +22,12 @@ async function bootstrap(): Promise<void> {
       env.ALEGRA_SYNC_CATEGORY_NAME,  // default: 'Tienda Virtual y Física'
       env.ALEGRA_WAREHOUSE_NAME,       // default: 'Principal'
   );
+
+  // ── 2b. Resolver location_id de Shopify automáticamente ───────────────────
+  // Consulta /locations.json y elige la location correcta sin configuración
+  // manual. Si Shopify aún no está autenticado (token vacío/atkn_), no bloquea
+  // el arranque — se reintenta automáticamente tras /setup/shopify/callback.
+  await bootstrapShopifyIds(env.SHOPIFY_LOCATION_NAME || undefined);
 
   // ── 3. Crear app Express ───────────────────────────────────────────────────
   const app = createApp();

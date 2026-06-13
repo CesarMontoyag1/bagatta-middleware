@@ -20,7 +20,12 @@ const envSchema = z.object({
   SHOPIFY_SHOP_DOMAIN:    z.string().min(1),
   SHOPIFY_API_VERSION:    z.string().default('2024-04'),
   SHOPIFY_WEBHOOK_SECRET: z.string().min(1),
-  SHOPIFY_LOCATION_ID:    z.string().min(1),
+  // SHOPIFY_LOCATION_ID ya no es obligatoria — se resuelve automáticamente
+  // al arrancar (shopifyBootstrap) consultando /locations.json.
+  // SHOPIFY_LOCATION_NAME es opcional: si tienes varias locations y quieres
+  // forzar una específica por nombre exacto, defínela aquí.
+  SHOPIFY_LOCATION_ID:   z.string().default(''),
+  SHOPIFY_LOCATION_NAME: z.string().default(''),
 
   // El access token se obtiene via OAuth (/setup/shopify/install).
   // Puede estar vacío inicialmente — el setup lo completa automáticamente.

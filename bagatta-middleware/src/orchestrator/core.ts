@@ -382,40 +382,66 @@ class OrchestratorCore {
           const alegraItem     = await alegraConnector.getItem(alegraItemId);
           const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
 
-          // Calcular deltas reales acumulados durante el downtime.
-          // Si inventory_management !== 'shopify', Shopify devuelve 0 siempre → ignorar delta.
-          const deltaShopifyCatchup = shopifyTracking === 'shopify'
-              ? master.stockShopifyLast - currentShopify
-              : 0;
-          const deltaAlegraCatchup  = master.stockAlegraLast  - currentAlegra;
+          // ── Lógica de catchup basada en realidad, no en deltas ─────────────
+          //
+          // NO usamos stockAlegraLast/stockShopifyLast para calcular deltas en el
+          // catchup porque esos valores pueden estar desincronizados por:
+          //   - Ajustes de inventario que fallaron silenciosamente
+          //   - Reinicios de la BD o migraciones
+          //   - Vinculación de ítems existentes (donde _last queda en 0)
+          //
+          // En cambio, tomamos el stock REAL actual de cada plataforma y elegimos
+          // la fuente de verdad correcta según el contexto:
+          //   - Shopify con tracking → Shopify manda (es la plataforma de ventas)
+          //   - Sin tracking en Shopify → Alegra manda (es donde se gestiona el stock)
+          //   - Si ambos tienen stock diferente → tomar el mayor (evitar pérdida de stock)
 
-          if (deltaShopifyCatchup === 0 && deltaAlegraCatchup === 0) continue; // sin cambios
+          let targetStock: number;
+
+          if (shopifyTracking === 'shopify') {
+            // Shopify tiene tracking activo → es la fuente de verdad para stock
+            targetStock = currentShopify;
+          } else {
+            // Sin tracking en Shopify → Alegra es fuente de verdad
+            targetStock = currentAlegra;
+          }
 
           const oldGlobal = master.stockGlobal;
-          const newGlobal = Math.max(0, oldGlobal - deltaShopifyCatchup - deltaAlegraCatchup);
+
+          // Si el master ya coincide con el target Y Alegra ya lo tiene correcto → skip
+          if (oldGlobal === targetStock && currentAlegra === targetStock) {
+            continue;
+          }
 
           logger.info(
-              `Catchup SKU ${sku}: master=${oldGlobal}, ` +
-              `Δshopify=${deltaShopifyCatchup}, Δalegra=${deltaAlegraCatchup} → nuevo=${newGlobal}`,
+              `Catchup SKU ${sku}: Shopify=${currentShopify} Alegra=${currentAlegra} ` +
+              `master=${oldGlobal} → target=${targetStock}`,
           );
 
+          // Actualizar master con la realidad
           await prisma.masterInventory.update({
             where: { sku },
-            data:  {
-              stockGlobal:      newGlobal,
-              stockShopifyLast: shopifyTracking === 'shopify' ? newGlobal : master.stockShopifyLast,
-              stockAlegraLast:  newGlobal,
+            data: {
+              stockGlobal:      targetStock,
+              stockShopifyLast: shopifyTracking === 'shopify' ? currentShopify : targetStock,
+              stockAlegraLast:  targetStock,
               lastUpdatedBy:    'catchup_sync',
             },
           });
 
-          // Solo propagar a Shopify si tiene tracking activado
-          if (shopifyTracking === 'shopify') {
-            await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
-          } else {
-            logger.debug(
-                `Catchup SKU ${sku}: omitiendo setInventoryLevel (inventory_management="${shopifyTracking ?? 'null'}"). ` +
-                `Activa "Track quantity" en Shopify para sincronización bidireccional.`,
+          // Sincronizar Shopify si tiene tracking y difiere del target
+          if (shopifyTracking === 'shopify' && currentShopify !== targetStock) {
+            await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, targetStock);
+          }
+
+          // Sincronizar Alegra si difiere del target
+          if (currentAlegra !== targetStock) {
+            const adjustQty = targetStock - currentAlegra;
+            logger.info(`Catchup: ajustando Alegra ítem ${entry.alegraItemId}: ${currentAlegra} → ${targetStock} (delta=${adjustQty})`);
+            await alegraConnector.adjustStock(
+                entry.alegraItemId,
+                adjustQty,
+                `Catchup sync — alineando con stock real (${currentAlegra} → ${targetStock})`,
             );
           }
 

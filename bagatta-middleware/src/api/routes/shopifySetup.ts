@@ -19,6 +19,7 @@ import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { shopifyTokenManager } from '../../orchestrator/connectors/shopify-auth';
 import { shopifyConnector } from '../../orchestrator/connectors/shopify';
+import { bootstrapShopifyIds, resetShopifyBootstrap } from '../../services/shopifyBootstrap';
 
 const router = Router();
 
@@ -29,6 +30,7 @@ const SCOPES = [
     'write_inventory',
     'read_orders',
     'read_product_listings',
+    'read_locations',   // requerido para auto-resolver location_id al arrancar
 ].join(',');
 
 // State CSRF en memoria — válido por 10 minutos
@@ -212,6 +214,18 @@ router.get('/shopify/callback', async (req: Request, res: Response) => {
             logger.warn('No se pudo verificar la conexión tras el OAuth (no es crítico)');
         }
 
+        // ── Resolver location_id ahora que el token es válido ─────────────────
+        // Si el bootstrap inicial no pudo resolverlo (token no estaba listo
+        // al arrancar), se resuelve ahora automáticamente.
+        let locationInfo: { location_id?: string } = {};
+        try {
+            resetShopifyBootstrap();
+            const ids = await bootstrapShopifyIds(env.SHOPIFY_LOCATION_NAME || undefined);
+            if (ids) locationInfo = { location_id: ids.locationId };
+        } catch (err) {
+            logger.warn(`No se pudo resolver location_id tras OAuth: ${(err as Error).message}`);
+        }
+
         res.json({
             success:      true,
             message:      '✅  Shopify conectado correctamente',
@@ -219,6 +233,7 @@ router.get('/shopify/callback', async (req: Request, res: Response) => {
             token_type:   accessToken.startsWith('shpat_') ? 'offline (permanente)' : 'otro',
             scopes,
             shop:         shopInfo,
+            location:     locationInfo,
             next_steps: [
                 'El token fue guardado en .env y activado en memoria automáticamente',
                 'NO necesitas reiniciar el servidor — el polling ya usa el nuevo token',
