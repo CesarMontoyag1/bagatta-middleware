@@ -137,7 +137,7 @@ class AlegraConnector {
     }
 
     const { warehouseId } = getAlegraIds();
-    const type     = delta > 0 ? 'positive' : 'negative';
+    const type     = delta > 0 ? 'in' : 'out';
     const quantity = Math.abs(delta);
 
     const payload = {
@@ -145,7 +145,12 @@ class AlegraConnector {
       description: reason,
       warehouse:   { id: warehouseId },
       items: [
-        { item: { id: alegraItemId }, type, quantity },
+        {
+          id:       alegraItemId,   // ID directo, no anidado en { item: { id } }
+          type:     delta > 0 ? 'in' : 'out',  // Alegra acepta 'in' o 'out'
+          quantity,
+          unitCost: 0,             // requerido por Alegra aunque sea 0
+        },
       ],
     };
 
