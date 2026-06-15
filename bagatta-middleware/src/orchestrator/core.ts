@@ -234,6 +234,7 @@ class OrchestratorCore {
             alegraItemId,
             adjustQty,
             `Sync Bagatta Middleware — Δshopify:${deltaShopify} Δalegra:${deltaAlegra}`,
+            entry.lastKnownCost.toNumber(),  // preservar costo promedio en Alegra
         );
       }
 
@@ -442,23 +443,14 @@ class OrchestratorCore {
                 entry.alegraItemId,
                 adjustQty,
                 `Catchup sync — alineando con stock real (${currentAlegra} → ${targetStock})`,
-            );
-          }
-
-          // Propagar a Alegra (ajuste relativo al stock actual)
-          const adjustQty = newGlobal - currentAlegra;
-          if (adjustQty !== 0) {
-            await alegraConnector.adjustStock(
-                alegraItemId,
-                adjustQty,
-                `Catchup sync — downtime de ${gapMinutes.toFixed(0)} min`,
+                entry.lastKnownCost.toNumber(),  // preservar costo promedio en Alegra
             );
           }
 
           await auditService.logStockChange({
             sku,
-            oldStock:       oldGlobal,
-            newStock:       newGlobal,
+            oldStock:       master.stockGlobal,
+            newStock:       targetStock,
             origin:         'catchup_sync',
             sourceEventRef: `catchup_${since.toISOString()}`,
           });
@@ -1321,6 +1313,7 @@ class OrchestratorCore {
               entry.alegraItemId,
               adjustQty,
               `Reset manual desde realidad — stock ajustado a ${newGlobal}`,
+              entry.lastKnownCost.toNumber(),  // preservar costo promedio en Alegra
           );
         }
 

@@ -16,9 +16,9 @@ function safeStringify(value: unknown): string {
         }
         // Omitir propiedades internas de Axios/Node que no aportan info útil
         if (
-            _key === 'socket'   ||
-            _key === 'agent'    ||
-            _key === 'sockets'  ||
+            _key === 'socket'      ||
+            _key === 'agent'       ||
+            _key === 'sockets'     ||
             _key === '_httpMessage'
         ) return '[omitted]';
         return val;
@@ -27,37 +27,42 @@ function safeStringify(value: unknown): string {
   );
 }
 
+/** Type guard para errores de Axios */
+function isAxiosError(val: unknown): val is {
+  message:   string;
+  isAxiosError: true;
+  config?:   { url?: string; method?: string };
+  response?: { status?: number; data?: unknown };
+} {
+  return (
+      typeof val === 'object' &&
+      val !== null &&
+      'isAxiosError' in val &&
+      (val as Record<string, unknown>)['isAxiosError'] === true
+  );
+}
+
 /**
  * Extrae un mensaje legible de cualquier tipo de valor logueable.
  * Si es un Error de Axios, muestra status + data sin estructura circular.
  */
 function formatMeta(meta: unknown): string {
-  if (!meta || (typeof meta === 'object' && Object.keys(meta as object).length === 0)) {
-    return '';
-  }
+  // Sin meta o meta vacío
+  if (meta === null || meta === undefined) return '';
+  if (typeof meta === 'object' && Object.keys(meta as object).length === 0) return '';
 
   // Error de Axios — extraer solo lo relevante
-  if (
-      typeof meta === 'object' &&
-      meta !== null &&
-      'isAxiosError' in meta &&
-      (meta as { isAxiosError: boolean }).isAxiosError
-  ) {
-    const axiosErr = meta as {
-      message:   string;
-      config?:   { url?: string; method?: string };
-      response?: { status?: number; data?: unknown };
-    };
+  if (isAxiosError(meta)) {
     return safeStringify({
-      message:  axiosErr.message,
-      url:      axiosErr.config?.url,
-      method:   axiosErr.config?.method,
-      status:   axiosErr.response?.status,
-      data:     axiosErr.response?.data,
+      message: meta.message,
+      url:     meta.config?.url,
+      method:  meta.config?.method,
+      status:  meta.response?.status,
+      data:    meta.response?.data,
     });
   }
 
-  // Error estándar
+  // Error estándar de JS
   if (meta instanceof Error) {
     return safeStringify({ message: meta.message, stack: meta.stack });
   }
@@ -68,15 +73,13 @@ function formatMeta(meta: unknown): string {
 const { combine, timestamp, printf, colorize, errors } = winston.format;
 
 const logFormat = printf((info) => {
-  const ts   = (info.timestamp as string).slice(11, 19); // HH:MM:SS
-  const lvl  = (info.level as string).padEnd(5);
+  const ts  = (info.timestamp as string).slice(11, 19); // HH:MM:SS
+  const lvl = (info.level as string).padEnd(5);
 
-  // Extraer el requestId si viene en el meta
   const reqId = (info['request_id'] as string | undefined)
       ? ` [${info['request_id']}]`
       : '';
 
-  // Meta: todo lo que no es timestamp/level/message
   const { timestamp: _ts, level: _lvl, message: _msg, ...rest } = info;
   const metaStr = formatMeta(Object.keys(rest).length > 0 ? rest : undefined);
 

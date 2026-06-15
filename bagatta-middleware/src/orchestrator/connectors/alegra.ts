@@ -117,20 +117,21 @@ class AlegraConnector {
   }
 
   /**
-   * Ajusta el stock de un ítem en Alegra mediante un inventory-adjustment.
+   * Ajusta el stock de un ítem en Alegra.
    *
-   * Alegra requiere el campo `type` para distinguir entrada vs salida:
-   *   - type: "positive" → ENTRADA de inventario (quantity debe ser positivo)
-   *   - type: "negative" → SALIDA de inventario (quantity debe ser positivo también,
-   *                          el signo lo da el `type`, no el número)
-   *
-   * `delta` aquí puede ser positivo o negativo según la dirección del cambio
-   * calculado por el orquestador. Esta función traduce ese delta al formato
-   * que Alegra espera: type correcto + quantity siempre positivo (valor absoluto).
-   *
-   * Si delta === 0 no hace nada (no se debe llamar, pero por seguridad no falla).
+   * IMPORTANTE sobre unitCost:
+   * - En ajustes de ENTRADA ('in'), Alegra usa unitCost para recalcular el
+   *   costo promedio ponderado. Enviar 0 corrompe el costo promedio contable.
+   * - Si no se pasa unitCost, se lee el costo actual del ítem desde Alegra
+   *   antes de hacer el ajuste (una llamada adicional pero necesaria).
+   * - En ajustes de SALIDA ('out'), unitCost puede ser 0 (Alegra lo ignora).
    */
-  async adjustStock(alegraItemId: string, delta: number, reason: string): Promise<void> {
+  async adjustStock(
+      alegraItemId: string,
+      delta: number,
+      reason: string,
+      unitCost?: number,
+  ): Promise<void> {
     if (delta === 0) {
       logger.debug(`Alegra: adjustStock con delta=0 para ítem ${alegraItemId}. Omitido.`);
       return;
@@ -140,16 +141,31 @@ class AlegraConnector {
     const type     = delta > 0 ? 'in' : 'out';
     const quantity = Math.abs(delta);
 
+    // Para entradas, usar el costo real del ítem para no corromper el costo promedio.
+    // Si no se pasó, leerlo desde Alegra.
+    let resolvedCost = unitCost ?? 0;
+    if (type === 'in' && resolvedCost === 0) {
+      try {
+        const item = await this.getItem(alegraItemId);
+        resolvedCost = item.inventory?.unitCost ?? 0;
+        if (resolvedCost > 0) {
+          logger.debug(`Alegra: usando unitCost=${resolvedCost} del ítem ${alegraItemId} para ajuste de entrada`);
+        }
+      } catch {
+        logger.warn(`Alegra: no se pudo leer unitCost del ítem ${alegraItemId}. Usando 0 (puede afectar costo promedio).`);
+      }
+    }
+
     const payload = {
       date:        new Date().toISOString().split('T')[0],
       description: reason,
       warehouse:   { id: warehouseId },
       items: [
         {
-          id:       alegraItemId,   // ID directo, no anidado en { item: { id } }
-          type:     delta > 0 ? 'in' : 'out',  // Alegra acepta 'in' o 'out'
+          id:       alegraItemId,
+          type,
           quantity,
-          unitCost: 0,             // requerido por Alegra aunque sea 0
+          unitCost: resolvedCost,
         },
       ],
     };
@@ -158,8 +174,8 @@ class AlegraConnector {
 
     const { data } = await this.client.post('/inventory-adjustments', payload);
     logger.info(
-        `Alegra: ajuste inventario ítem ${alegraItemId} → ${type} ${quantity} (delta=${delta}) | ` +
-        `Respuesta id=${data?.id ?? 'N/A'}`,
+        `Alegra: ajuste inventario ítem ${alegraItemId} → ${type} ${quantity} ` +
+        `(delta=${delta}, unitCost=${resolvedCost}) | Respuesta id=${data?.id ?? 'N/A'}`,
     );
   }
 
