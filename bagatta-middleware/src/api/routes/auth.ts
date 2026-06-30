@@ -12,6 +12,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
 
+//correccion implementada para el auth.
 // ── Helpers ───────────────────────────────────────────────────────────────────
 // Hash de propósito general (NO para contraseñas) — se usa solo para los
 // refresh tokens, que ya son aleatorios de alta entropía (UUID v4), no
