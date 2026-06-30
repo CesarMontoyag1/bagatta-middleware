@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
+import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../../db/prisma';
 import { JWT_PRIVATE_KEY, env } from '../../config/env';
@@ -12,24 +13,30 @@ import { v4 as uuidv4 } from 'uuid';
 const router = Router();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function simpleHash(value: string): string {
+// Hash de propósito general (NO para contraseñas) — se usa solo para los
+// refresh tokens, que ya son aleatorios de alta entropía (UUID v4), no
+// contraseñas elegidas por humanos. Para contraseñas siempre se usa bcrypt.
+function fastHash(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
 function generateAccessToken(userId: string, role: string): string {
   return jwt.sign(
-    { sub: userId, role, jti: uuidv4() },
-    JWT_PRIVATE_KEY,
-    { algorithm: 'RS256', expiresIn: env.JWT_ACCESS_EXPIRES_IN as any },
+      { sub: userId, role, jti: uuidv4() },
+      JWT_PRIVATE_KEY,
+      { algorithm: 'RS256', expiresIn: env.JWT_ACCESS_EXPIRES_IN as any },
   );
 }
 
-const BRUTE_FORCE_LIMIT     = 5;   // intentos fallidos
-const BRUTE_FORCE_WINDOW_MS = 15 * 60 * 1000; // 15 min
-const BRUTE_FORCE_BLOCK_MS  = 30 * 60 * 1000; // 30 min bloqueo
+const BRUTE_FORCE_LIMIT    = 5;   // intentos fallidos
+const BRUTE_FORCE_BLOCK_MS = 30 * 60 * 1000; // 30 min: ventana de conteo Y duración del bloqueo
 
 async function checkBruteForce(ip: string, email: string): Promise<void> {
-  const windowStart = new Date(Date.now() - BRUTE_FORCE_WINDOW_MS);
+  // Antes: se contaban fallos en una ventana de 15 min pero el mensaje
+  // prometía 30 min de bloqueo (BRUTE_FORCE_BLOCK_MS nunca se usaba).
+  // Ahora la ventana de conteo y la duración del bloqueo son la misma,
+  // así el bloqueo real dura lo que el mensaje indica.
+  const windowStart = new Date(Date.now() - BRUTE_FORCE_BLOCK_MS);
   const failCount = await prisma.loginAttempt.count({
     where: { ipAddress: ip, email, success: false, createdAt: { gte: windowStart } },
   });
@@ -63,20 +70,10 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response, next:
 
     if (!user) { await failAttempt(); return; }
 
-    // Verificar contraseña
-    // En producción real usa bcrypt. El hash temporal del seed se detecta por el prefijo.
-    let valid = false;
-    if (user.passwordHash.startsWith('TEMP_SEED_HASH:')) {
-      const tempHash = user.passwordHash.replace('TEMP_SEED_HASH:', '');
-      valid = simpleHash(password) === tempHash;
-      if (valid) {
-        // Migrar a SHA256 permanente (en un proyecto real usarías bcrypt aquí)
-        const newHash = simpleHash(password);
-        await prisma.user.update({ where: { id: user.id }, data: { passwordHash: newHash } });
-      }
-    } else {
-      valid = simpleHash(password) === user.passwordHash;
-    }
+    // Verificar contraseña con bcrypt (lento + salt automático).
+    // Nunca usar SHA256/MD5 puro para contraseñas: son hashes rápidos
+    // diseñados para integridad de datos, no para resistir fuerza bruta.
+    const valid = await bcrypt.compare(password, user.passwordHash);
 
     if (!valid) { await failAttempt(); return; }
 
@@ -88,7 +85,7 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response, next:
     // Generar tokens
     const accessToken = generateAccessToken(user.id, user.role);
     const refreshTokenRaw = uuidv4();
-    const refreshTokenHash = simpleHash(refreshTokenRaw);
+    const refreshTokenHash = fastHash(refreshTokenRaw);
     const refreshExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
     await prisma.refreshToken.create({
@@ -109,13 +106,17 @@ router.post('/login', authRateLimiter, async (req: Request, res: Response, next:
 });
 
 // ── POST /auth/refresh ────────────────────────────────────────────────────────
+// Rotación de refresh token: cada uso invalida el token anterior y emite uno
+// nuevo. Si un token robado se usa después de que el legítimo ya rotó (o
+// viceversa), el find ya no lo encuentra válido, lo cual es una señal de
+// robo de token que antes no se podía detectar.
 router.post('/refresh', authRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const parsed = refreshSchema.safeParse(req.body);
     if (!parsed.success) throw new ValidationError('refresh_token inválido');
 
     const { refresh_token } = parsed.data;
-    const tokenHash = simpleHash(refresh_token);
+    const tokenHash = fastHash(refresh_token);
 
     const stored = await prisma.refreshToken.findFirst({
       where: { tokenHash, expiresAt: { gt: new Date() } },
@@ -126,9 +127,25 @@ router.post('/refresh', authRateLimiter, async (req: Request, res: Response, nex
       throw new UnauthorizedError('Refresh token inválido o expirado');
     }
 
+    // Rotación: invalidar el token usado y emitir uno nuevo
+    const newRefreshTokenRaw = uuidv4();
+    const newRefreshTokenHash = fastHash(newRefreshTokenRaw);
+    const refreshExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    await prisma.$transaction([
+      prisma.refreshToken.delete({ where: { id: stored.id } }),
+      prisma.refreshToken.create({
+        data: { userId: stored.user.id, tokenHash: newRefreshTokenHash, expiresAt: refreshExpiry },
+      }),
+    ]);
+
     const accessToken = generateAccessToken(stored.user.id, stored.user.role);
 
-    res.json({ access_token: accessToken, expires_in: 28800 });
+    res.json({
+      access_token:  accessToken,
+      refresh_token: newRefreshTokenRaw,
+      expires_in:    28800,
+    });
 
   } catch (err) {
     next(err);
@@ -144,7 +161,7 @@ router.post('/logout', verifyJwt, requireRole('readonly'), async (req: Request, 
       return;
     }
 
-    const tokenHash = simpleHash(parsed.data.refresh_token);
+    const tokenHash = fastHash(parsed.data.refresh_token);
     await prisma.refreshToken.deleteMany({ where: { tokenHash } });
     res.json({ message: 'Sesión cerrada correctamente' });
   } catch (err) {

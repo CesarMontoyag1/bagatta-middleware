@@ -7,32 +7,51 @@ import { JwtPayload } from '../../types';
 import { UnauthorizedError, ForbiddenError } from '../../utils/errors';
 import { prisma } from '../../db/prisma';
 
-// ── JWT verification ──────────────────────────────────────────────────────────
-export function verifyJwt(req: Request, _res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-
-  // SSE también acepta token como query param (EventSource no soporta headers)
-  const token =
-    (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null) ??
-    (req.query.token as string | undefined) ??
-    null;
-
+// ── JWT verification (solo header Authorization) ───────────────────────────────
+function verifyToken(token: string | null): JwtPayload {
   if (!token) {
-    return next(new UnauthorizedError('Token no proporcionado'));
+    throw new UnauthorizedError('Token no proporcionado');
   }
 
   try {
-    const payload = jwt.verify(token, JWT_PUBLIC_KEY, {
-      algorithms: ['RS256'],
-    }) as JwtPayload;
-
-    req.user = payload;
-    next();
+    return jwt.verify(token, JWT_PUBLIC_KEY, { algorithms: ['RS256'] }) as JwtPayload;
   } catch (err) {
     if (err instanceof jwt.TokenExpiredError) {
-      return next(new UnauthorizedError('Token expirado'));
+      throw new UnauthorizedError('Token expirado');
     }
-    return next(new UnauthorizedError('Token inválido'));
+    throw new UnauthorizedError('Token inválido');
+  }
+}
+
+export function verifyJwt(req: Request, _res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  try {
+    req.user = verifyToken(token);
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── JWT verification para SSE ───────────────────────────────────────────────
+// EventSource no soporta headers personalizados, así que SOLO este endpoint
+// (GET /sync/stream) acepta el token como query param. No usar esta función
+// en ninguna otra ruta: un token en la URL puede quedar expuesto en logs del
+// servidor, historial del navegador o en el header Referer.
+export function verifyJwtSSE(req: Request, _res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  const token =
+      (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null) ??
+      (req.query.token as string | undefined) ??
+      null;
+
+  try {
+    req.user = verifyToken(token);
+    next();
+  } catch (err) {
+    next(err);
   }
 }
 
@@ -71,7 +90,7 @@ export function verifyShopifyHmac(req: Request, _res: Response, next: NextFuncti
       data: {
         type:   'webhook_hmac_failure',
         detail: `Webhook recibido en ${req.path} sin header X-Shopify-Hmac-Sha256. ` +
-                `IP: ${req.ip}. Posible petición no autorizada o mal configurada.`,
+            `IP: ${req.ip}. Posible petición no autorizada o mal configurada.`,
       },
     }).catch(() => {}); // fire-and-forget
     return next(new UnauthorizedError('Firma HMAC de Shopify ausente'));
@@ -84,17 +103,17 @@ export function verifyShopifyHmac(req: Request, _res: Response, next: NextFuncti
   }
 
   const digest = crypto
-    .createHmac('sha256', env.SHOPIFY_WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest('base64');
+      .createHmac('sha256', env.SHOPIFY_WEBHOOK_SECRET)
+      .update(rawBody)
+      .digest('base64');
 
   // Comparación en tiempo constante — previene timing attacks
   const digestBuffer = Buffer.from(digest, 'base64');
   const headerBuffer = Buffer.from(hmacHeader, 'base64');
 
   if (
-    digestBuffer.length !== headerBuffer.length ||
-    !crypto.timingSafeEqual(digestBuffer, headerBuffer)
+      digestBuffer.length !== headerBuffer.length ||
+      !crypto.timingSafeEqual(digestBuffer, headerBuffer)
   ) {
     // HMAC inválido: el secreto en .env no coincide con el de Shopify.
     // Registrar alerta visible en el dashboard para que el operador lo detecte.
@@ -102,10 +121,10 @@ export function verifyShopifyHmac(req: Request, _res: Response, next: NextFuncti
       data: {
         type:   'webhook_hmac_failure',
         detail: `HMAC inválido en webhook ${req.path}. ` +
-                `El SHOPIFY_WEBHOOK_SECRET del middleware no coincide con el secreto ` +
-                `configurado en Shopify → Settings → Notifications → Webhooks. ` +
-                `Los webhooks de Shopify están siendo rechazados — los productos ` +
-                `creados en Shopify NO se sincronizan con Alegra hasta que se corrija.`,
+            `El SHOPIFY_WEBHOOK_SECRET del middleware no coincide con el secreto ` +
+            `configurado en Shopify → Settings → Notifications → Webhooks. ` +
+            `Los webhooks de Shopify están siendo rechazados — los productos ` +
+            `creados en Shopify NO se sincronizan con Alegra hasta que se corrija.`,
       },
     }).catch(() => {}); // fire-and-forget — no bloquear el rechazo
     return next(new UnauthorizedError('Firma HMAC de Shopify inválida'));

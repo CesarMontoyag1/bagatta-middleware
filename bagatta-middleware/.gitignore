@@ -6,3 +6,4 @@ dist/
 .DS_Store
 prisma/migrations/
 .idea
+.bagatta_token.json

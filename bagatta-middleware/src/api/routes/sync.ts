@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { verifyJwt, requireRole } from '../middlewares/auth';
+import { verifyJwt, verifyJwtSSE, requireRole } from '../middlewares/auth';
 import { orchestrator } from '../../orchestrator/core';
 import { sseService } from '../../services/sse';
 import { auditService } from '../../services/audit';
@@ -13,7 +13,7 @@ const router = Router();
 
 // ── SSE /sync/stream ──────────────────────────────────────────────────────────
 // El token se acepta como query param porque EventSource no soporta headers
-router.get('/stream', verifyJwt, requireRole('readonly'), (_req: Request, res: Response) => {
+router.get('/stream', verifyJwtSSE, requireRole('readonly'), (_req: Request, res: Response) => {
   const clientId = uuidv4();
   sseService.addClient(clientId, res);
   // La conexión se mantiene abierta — sseService gestiona el cierre
