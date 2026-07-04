@@ -161,8 +161,10 @@ async function resolveAccountTemplate(): Promise<AlegraAccountTemplate | null> {
             return null;
         }
 
+
+        // Descomentar para un posible debug futuro.
         // Log temporal para diagnosticar los nombres exactos de campos que devuelve Alegra
-        logger.info(`[Bootstrap:debug] Ítem plantilla raw: ${JSON.stringify(item)}`);
+        //logger.info(`[Bootstrap:debug] Ítem plantilla raw: ${JSON.stringify(item)}`);
 
         const account: AlegraAccountTemplate = {};
 
