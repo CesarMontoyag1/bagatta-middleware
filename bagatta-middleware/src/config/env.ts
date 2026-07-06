@@ -43,6 +43,10 @@ const envSchema = z.object({
   ALEGRA_WAREHOUSE_NAME:     z.string().default('Principal'),
   ALEGRA_UNIT_OF_MEASURE:    z.string().default('Unidad'),
 
+  ALEGRA_INVENTORY_ACCOUNT_ID:   z.string().optional(),
+  ALEGRA_SALE_COST_ACCOUNT_ID:   z.string().optional(),
+  ALEGRA_SALE_INCOME_ACCOUNT_ID: z.string().optional(),
+
   // ── Sincronización ───────────────────────────────────────────────────────
   POLLING_INTERVAL_SECONDS:         z.coerce.number().default(10),
   CATCHUP_THRESHOLD_MINUTES:        z.coerce.number().default(2),
