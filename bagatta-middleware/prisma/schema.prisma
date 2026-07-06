@@ -292,4 +292,5 @@ enum AlertType {
   sku_missing
   catchup_completed
   orphan_repaired
+  alegra_orphan_product
 }

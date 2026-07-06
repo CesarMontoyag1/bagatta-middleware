@@ -70,6 +70,16 @@ class OrchestratorCore {
         // No abortar — continuar con el ciclo de reconciliación normal
       }
 
+      // ── Detectar productos creados directamente en Alegra (fuera de Shopify) ──
+      // Solo informativo — no crea ni actualiza inventario, ver detectAlegraOrphanProducts.
+      try {
+        await this.detectAlegraOrphanProducts();
+      } catch (err) {
+        const msg = `Error en detección de huérfanos de Alegra: ${(err as Error).message}`;
+        logger.warn(msg);
+        result.errors.push(msg);
+      }
+
       // ── Detectar y reparar registros huérfanos en product_catalog ─────────
       // Si master_inventory fue borrado manualmente, o el ítem en Alegra fue
       // eliminado fuera del middleware, el catalog queda en estado huérfano:
@@ -510,6 +520,10 @@ class OrchestratorCore {
   // ═══════════════════════════════════════════════════════════════════════════
   private pendingNewProducts = new Map<string, { product: ShopifyProduct; count: number }>();
 
+  // Refs (SKUs) de ítems de Alegra ya alertados como "huérfanos" — evita
+  // spamear la misma alerta cada 10s mientras el producto siga sin vincular.
+  private alertedAlegraOrphanRefs = new Set<string>();
+
   private async detectNewShopifyProducts(): Promise<void> {
     // Traer todos los productos de Shopify de una sola vez
     const shopifyProducts = await shopifyConnector.listProducts();
@@ -581,6 +595,50 @@ class OrchestratorCore {
           // Mantener en mapa para reintentar en el siguiente ciclo
         }
       }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  DETECCIÓN DE PRODUCTOS CREADOS DIRECTAMENTE EN ALEGRA (categoría sincronizada)
+  //  Shopify es el maestro para creación — un ítem creado a mano en Alegra con
+  //  la categoría "Tienda Virtual y Física" queda fuera del catalog y NUNCA
+  //  recibirá ajustes de inventario automáticos. Esto es solo informativo:
+  //  no crea, no borra, no toca stock. Solo avisa para que se corrija a mano.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private async detectAlegraOrphanProducts(): Promise<void> {
+    // getSyncedItems() ya filtra por la categoría configurada (Tienda Virtual y Física)
+    const items = await alegraConnector.getSyncedItems();
+    if (!items.length) return;
+
+    const registeredSkus = new Set(
+        (await prisma.productCatalog.findMany({ select: { sku: true } }))
+            .map((r: { sku: string }) => r.sku),
+    );
+
+    const currentOrphanRefs = new Set<string>();
+
+    for (const item of items) {
+      const ref = item.reference?.trim();
+      if (!ref || registeredSkus.has(ref)) continue;
+
+      currentOrphanRefs.add(ref);
+      if (this.alertedAlegraOrphanRefs.has(ref)) continue; // ya alertado — no repetir cada ciclo
+
+      const msg =
+          `Ítem "${item.name}" (ref=${ref}, alegra_item_id=${item.id}) fue creado ` +
+          `directamente en Alegra con categoría "Tienda Virtual y Física". No está ` +
+          `registrado en el catálogo — su inventario NO se sincronizará con Shopify. ` +
+          `Créalo desde Shopify o cambia su categoría en Alegra.`;
+
+      logger.warn(`[AlegraOrphan] ${msg}`);
+      await auditService.createAlert({ type: 'alegra_orphan_product', sku: ref, detail: msg });
+
+      this.alertedAlegraOrphanRefs.add(ref);
+    }
+
+    // Limpiar del set los refs que ya no son huérfanos (se vincularon o se eliminaron en Alegra)
+    for (const ref of this.alertedAlegraOrphanRefs) {
+      if (!currentOrphanRefs.has(ref)) this.alertedAlegraOrphanRefs.delete(ref);
     }
   }
 

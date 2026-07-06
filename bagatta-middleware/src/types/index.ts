@@ -122,7 +122,8 @@ export interface AlegraItem {
   name: string;
   reference: string; // = SKU de Shopify
   status?: string;
-  category?: { id: number | string; name: string };
+  category?: { id: number | string; name: string };     // cuenta contable de ventas (ej. "Ventas")
+  itemCategory?: { id: number | string; name: string };  // categoría comercial (ej. "Tienda Virtual y Física")
   price: Array<{ idPriceList: number; name: string; price: number }>;
   inventory: {
     unit: string;

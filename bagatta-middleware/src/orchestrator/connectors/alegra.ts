@@ -103,9 +103,12 @@ class AlegraConnector {
       const page = data as AlegraItem[];
       if (!page || page.length === 0) break;
 
+      // IMPORTANTE: Alegra tiene dos campos distintos —
+      // `category` = cuenta contable de ventas (ej. "Ventas")
+      // `itemCategory` = categoría comercial/de inventario (ej. "Tienda Virtual y Física")
+      // El filtro debe usar itemCategory, que es lo que resuelve el bootstrap.
       const synced = page.filter(
-          (item: AlegraItem & { category?: { id: string | number } }) =>
-              String(item.category?.id) === categoryId,
+          (item: AlegraItem) => String(item.itemCategory?.id) === categoryId,
       );
       allItems.push(...synced);
 
