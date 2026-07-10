@@ -3,6 +3,16 @@ import { env } from '../../config/env';
 import { logger } from '../../utils/logger';
 import { AlegraItem, AlegraItemCreatePayload, AlegraMovement } from '../../types';
 import { getAlegraIds } from '../../services/alegraBootstrap';
+import { TokenBucketLimiter } from '../../utils/rateLimiter';
+
+// Alegra no publica un límite de tasa tan explícito como el de Shopify
+// (2 req/s documentado). Este valor es conservador por precaución — si ves
+// que sigue siendo insuficiente (más 429 en los logs) o innecesariamente
+// lento (nunca se acerca a este límite), ajústalo aquí. No es un número
+// confirmado con la documentación oficial de Alegra, es un punto de partida
+// seguro dado lo que observamos bajo carga real.
+const alegraRateLimiter = new TokenBucketLimiter(3, 3);
+const MAX_ALEGRA_429_RETRIES = 3;
 
 class AlegraConnector {
   private client: AxiosInstance;
@@ -21,11 +31,36 @@ class AlegraConnector {
       timeout: 20000,
     });
 
+    this.client.interceptors.request.use(async (config) => {
+      await alegraRateLimiter.acquire();
+      return config;
+    });
+
     this.client.interceptors.response.use(
         (r) => r,
-        (err) => {
+        async (err) => {
           const status = err.response?.status;
           const url    = err.config?.url;
+
+          if (status === 429) {
+            const cfg = err.config as (typeof err.config & { __retryCount?: number });
+            const retryCount = cfg?.__retryCount ?? 0;
+
+            if (cfg && retryCount < MAX_ALEGRA_429_RETRIES) {
+              const retryAfterHeader = err.response?.headers?.['retry-after'];
+              const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : 2;
+              const waitMs = (Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : 2) * 1000;
+
+              logger.warn(
+                  `Alegra 429 en ${url} — reintento ${retryCount + 1}/${MAX_ALEGRA_429_RETRIES} en ${waitMs}ms`,
+              );
+
+              cfg.__retryCount = retryCount + 1;
+              await new Promise((resolve) => setTimeout(resolve, waitMs));
+              return this.client.request(cfg);
+            }
+          }
+
           logger.error(`Alegra API error ${status} en ${url}`, { data: err.response?.data });
           throw err;
         },
