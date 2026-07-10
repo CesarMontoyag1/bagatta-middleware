@@ -73,12 +73,17 @@ class OrchestratorCore {
 
       // ── Detectar productos creados directamente en Alegra (fuera de Shopify) ──
       // Solo informativo — no crea ni actualiza inventario, ver detectAlegraOrphanProducts.
-      try {
-        await this.detectAlegraOrphanProducts();
-      } catch (err) {
-        const msg = `Error en detección de huérfanos de Alegra: ${(err as Error).message}`;
-        logger.warn(msg);
-        result.errors.push(msg);
+      // Corre cada ORPHAN_CHECK_EVERY_N_CYCLES ciclos (no en cada uno) porque
+      // trae el listado completo de ítems de Alegra — es costoso y no urgente.
+      this.cycleCount++;
+      if (this.cycleCount % this.ORPHAN_CHECK_EVERY_N_CYCLES === 0) {
+        try {
+          await this.detectAlegraOrphanProducts();
+        } catch (err) {
+          const msg = `Error en detección de huérfanos de Alegra: ${(err as Error).message}`;
+          logger.warn(msg);
+          result.errors.push(msg);
+        }
       }
 
       // ── Detectar y reparar registros huérfanos en product_catalog ─────────
@@ -550,7 +555,15 @@ class OrchestratorCore {
   // cada SKU en vuelo dispara 3 requests (2 a Shopify, 1 a Alegra) — un
   // valor moderado evita saturar los rate limits de ambas APIs mientras
   // sigue dando una mejora grande frente al procesamiento 100% secuencial.
-  private readonly RECONCILE_CONCURRENCY = 5;
+  private readonly RECONCILE_CONCURRENCY = 10;
+
+  // Cada cuántos ciclos se corre detectAlegraOrphanProducts. Es puramente
+  // informativo (no toca inventario, ver la función para más contexto), así
+  // que no necesita correr cada ciclo — reduce el costo fijo por ciclo sin
+  // perder la detección, solo la retrasa un poco (aceptable para una alerta
+  // informativa, no para reconciliación de stock real).
+  private readonly ORPHAN_CHECK_EVERY_N_CYCLES = 5;
+  private cycleCount = 0;
 
   // Refs (SKUs) de ítems de Alegra ya alertados como "huérfanos" — evita
   // spamear la misma alerta cada 10s mientras el producto siga sin vincular.
