@@ -115,6 +115,31 @@ class OrchestratorCore {
           // deltasApplied cuenta solo los SKUs donde realmente se aplicó un cambio
           if (changed) result.deltasApplied++;
         } catch (err) {
+          const status = (err as { response?: { status?: number } }).response?.status;
+
+          // ── Auto-reparación: la variante ya no existe en Shopify ────────────
+          // Esto pasa cuando el webhook products/delete no llegó (Shopify no
+          // reintenta indefinidamente, o el evento se perdió por caída del
+          // servicio). Sin esto, el ciclo repetiría este mismo error 404 para
+          // siempre — en vez de eso, archivamos automáticamente, igual que
+          // hace handleProductDelete cuando el webhook sí llega.
+          if (status === 404) {
+            try {
+              await this.archiveVariant(entry.shopifyVariantId, `reconcile_404_self_heal_sku_${entry.sku}`);
+              logger.warn(
+                  `SKU ${entry.sku}: variante no encontrada en Shopify (404) — ` +
+                  `archivada automáticamente (probable webhook products/delete perdido).`,
+              );
+              continue; // no la contamos como error del ciclo, ya se auto-reparó
+            } catch (archiveErr) {
+              const archiveMsg =
+                  `Error auto-archivando SKU ${entry.sku} tras 404: ${(archiveErr as Error).message}`;
+              logger.error(archiveMsg);
+              result.errors.push(archiveMsg);
+              continue;
+            }
+          }
+
           const msg = `Error reconciliando SKU ${entry.sku}: ${(err as Error).message}`;
           logger.error(msg);
           result.errors.push(msg);
