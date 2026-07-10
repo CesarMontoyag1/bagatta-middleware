@@ -4,6 +4,18 @@ import { logger } from '../../utils/logger';
 import { ShopifyProduct, ShopifyInventoryLevel } from '../../types';
 import { shopifyTokenManager } from './shopify-auth';
 import { getShopifyLocationId } from '../../services/shopifyBootstrap';
+import { TokenBucketLimiter } from '../../utils/rateLimiter';
+
+// Límite real de la API REST Admin de Shopify: 2 requests/segundo sostenido
+// por app+tienda. Es una sola instancia compartida por TODO el conector —
+// no por request individual — para que la concurrencia de reconcileSku,
+// detectNewShopifyProducts, webhooks, etc. respeten juntos el mismo límite
+// global, en vez de cada uno pensar que tiene 2 req/s para sí solo.
+// Burst conservador (no asumimos que tenemos el balde completo de Shopify
+// disponible, ya que otras llamadas del mismo token también lo consumen).
+const shopifyRateLimiter = new TokenBucketLimiter(2, 2);
+
+const MAX_429_RETRIES = 3;
 
 class ShopifyConnector {
   private baseURL: string;
@@ -35,12 +47,45 @@ class ShopifyConnector {
       timeout: 15000,
     });
 
+    // ── Antes de cada request: esperar turno según el rate limiter ─────────
+    client.interceptors.request.use(async (config) => {
+      await shopifyRateLimiter.acquire();
+      return config;
+    });
+
     client.interceptors.response.use(
         (r) => r,
-        (err: AxiosError) => {
+        async (err: AxiosError) => {
           const status = err.response?.status;
           const url    = err.config?.url;
           const data   = err.response?.data;
+
+          // ── 429: reintentar con backoff, respetando Retry-After si viene ──
+          if (status === 429) {
+            const cfg = err.config as (typeof err.config & { __retryCount?: number });
+            const retryCount = cfg?.__retryCount ?? 0;
+
+            if (cfg && retryCount < MAX_429_RETRIES) {
+              const retryAfterHeader = err.response?.headers?.['retry-after'];
+              const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : 1;
+              const waitMs = (Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : 1) * 1000;
+
+              logger.warn(
+                  `Shopify 429 en ${url} — reintento ${retryCount + 1}/${MAX_429_RETRIES} ` +
+                  `en ${waitMs}ms (Retry-After respetado)`,
+              );
+
+              cfg.__retryCount = retryCount + 1;
+              await new Promise((resolve) => setTimeout(resolve, waitMs));
+              return client.request(cfg);
+            }
+
+            logger.error(
+                `Shopify 429 en ${url} — agotados los ${MAX_429_RETRIES} reintentos`, { data },
+            );
+            throw err;
+          }
+
           if (status === 401) {
             shopifyTokenManager.markInvalid();
             logger.error(`Shopify 401 en ${url} — token inválido`, { data });

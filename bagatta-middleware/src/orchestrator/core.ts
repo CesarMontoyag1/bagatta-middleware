@@ -555,7 +555,12 @@ class OrchestratorCore {
   // cada SKU en vuelo dispara 3 requests (2 a Shopify, 1 a Alegra) — un
   // valor moderado evita saturar los rate limits de ambas APIs mientras
   // sigue dando una mejora grande frente al procesamiento 100% secuencial.
-  private readonly RECONCILE_CONCURRENCY = 10;
+  // Con el rate limiter de Shopify (2 req/s) ya en su lugar, un valor más
+  // bajo aquí evita que muchas promesas se acumulen esperando el mismo token
+  // a la vez — el rate limiter ya serializa el acceso real a Shopify, así
+  // que la concurrencia solo ayuda a superponer la latencia de red y la
+  // llamada (no-competitiva) a Alegra.
+  private readonly RECONCILE_CONCURRENCY = 3;
 
   // Cada cuántos ciclos se corre detectAlegraOrphanProducts. Es puramente
   // informativo (no toca inventario, ver la función para más contexto), así
