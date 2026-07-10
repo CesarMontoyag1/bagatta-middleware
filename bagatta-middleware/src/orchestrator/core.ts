@@ -8,6 +8,7 @@ import { env } from '../config/env';
 import { getAlegraIds } from '../services/alegraBootstrap';
 import { AlegraItemCreatePayload, SyncCycleResult, ShopifyProduct } from '../types';
 import { buildIdempotencyKey } from '../utils/idempotency';
+import { mapWithConcurrency } from '../utils/concurrency';
 
 class OrchestratorCore {
   private isSyncing   = false;
@@ -108,8 +109,8 @@ class OrchestratorCore {
 
       result.skusChecked = catalog.length;
 
-      // ── Procesar cada SKU ──────────────────────────────────────────────────
-      for (const entry of catalog) {
+      // ── Procesar cada SKU (hasta RECONCILE_CONCURRENCY en paralelo) ────────
+      await mapWithConcurrency(catalog, this.RECONCILE_CONCURRENCY, async (entry: typeof catalog[number]) => {
         try {
           const changed = await this.reconcileSku(entry);
           // deltasApplied cuenta solo los SKUs donde realmente se aplicó un cambio
@@ -130,13 +131,13 @@ class OrchestratorCore {
                   `SKU ${entry.sku}: variante no encontrada en Shopify (404) — ` +
                   `archivada automáticamente (probable webhook products/delete perdido).`,
               );
-              continue; // no la contamos como error del ciclo, ya se auto-reparó
+              return; // no la contamos como error del ciclo, ya se auto-reparó
             } catch (archiveErr) {
               const archiveMsg =
                   `Error auto-archivando SKU ${entry.sku} tras 404: ${(archiveErr as Error).message}`;
               logger.error(archiveMsg);
               result.errors.push(archiveMsg);
-              continue;
+              return;
             }
           }
 
@@ -144,7 +145,7 @@ class OrchestratorCore {
           logger.error(msg);
           result.errors.push(msg);
         }
-      }
+      });
 
       // ── Marcar ciclo exitoso ───────────────────────────────────────────────
       await prisma.syncState.update({
@@ -544,6 +545,12 @@ class OrchestratorCore {
   //  el peor caso es esperar 2 ciclos adicionales (20 segundos) tras un restart.
   // ═══════════════════════════════════════════════════════════════════════════
   private pendingNewProducts = new Map<string, { product: ShopifyProduct; count: number }>();
+
+  // Cuántos SKUs se reconcilian en paralelo por ciclo. No poner muy alto:
+  // cada SKU en vuelo dispara 3 requests (2 a Shopify, 1 a Alegra) — un
+  // valor moderado evita saturar los rate limits de ambas APIs mientras
+  // sigue dando una mejora grande frente al procesamiento 100% secuencial.
+  private readonly RECONCILE_CONCURRENCY = 5;
 
   // Refs (SKUs) de ítems de Alegra ya alertados como "huérfanos" — evita
   // spamear la misma alerta cada 10s mientras el producto siga sin vincular.
