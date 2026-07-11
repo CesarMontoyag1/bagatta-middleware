@@ -192,6 +192,7 @@ class OrchestratorCore {
     sku:              string;
     shopifyVariantId: string;
     alegraItemId:     string;
+    shopifyInventoryItemId?: string | null;
     lastKnownPrice:   { toNumber(): number };
     lastKnownCost:    { toNumber(): number };
     inventory: {
@@ -214,6 +215,17 @@ class OrchestratorCore {
     const currentShopify         = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
     const alegraItem     = await alegraConnector.getItem(alegraItemId);
     const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
+
+    // ── Backfill: registros creados antes de shopifyInventoryItemId existir ──
+    // Se autocompleta la primera vez que este SKU pasa por reconciliación,
+    // así el webhook inventory_levels/update puede encontrarlo sin esperar
+    // a que todo el catálogo se vuelva a crear desde cero.
+    if (!entry.shopifyInventoryItemId) {
+      prisma.productCatalog.update({
+        where: { sku },
+        data:  { shopifyInventoryItemId: String(shopifyInventoryItemId) },
+      }).catch((err: Error) => logger.warn(`Backfill shopifyInventoryItemId falló para SKU ${sku}: ${err.message}`));
+    }
 
     // ── 2. Calcular deltas REALES (no snapshot comparison) ────────────────
     // RF-03: si ambas plataformas vendieron, capturamos ambos deltas independientemente.
@@ -827,9 +839,10 @@ class OrchestratorCore {
         // ── Insertar en product_catalog ───────────────────────────────────
         await prisma.productCatalog.create({
           data: {
-            shopifyVariantId: String(variant.id),
-            shopifyProductId: String(shopifyProduct.id),
-            alegraItemId:     String(alegraItem.id),
+            shopifyVariantId:       String(variant.id),
+            shopifyProductId:       String(shopifyProduct.id),
+            shopifyInventoryItemId: String(variant.inventory_item_id),
+            alegraItemId:           String(alegraItem.id),
             sku:              variant.sku,
             lastKnownName:    itemName,
             lastKnownPrice:   price,

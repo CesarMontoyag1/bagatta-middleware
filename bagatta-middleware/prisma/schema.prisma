@@ -26,6 +26,13 @@ model ProductCatalog {
   shopifyProductId String @map("shopify_product_id") @db.VarChar(64)
   alegraItemId     String @unique @map("alegra_item_id") @db.VarChar(64)
 
+  // Permite que el webhook inventory_levels/update encuentre el SKU
+  // correspondiente con un solo SELECT, sin tener que llamar a Shopify para
+  // traducir inventory_item_id → variant_id → sku. Nullable porque los
+  // registros creados antes de este campo se autocompletan (backfill)
+  // la primera vez que pasan por reconcileSku.
+  shopifyInventoryItemId String? @unique @map("shopify_inventory_item_id") @db.VarChar(64)
+
   // Clave lógica de sincronización — PK lógica del sistema
   sku String @unique @db.VarChar(128)
 
@@ -203,7 +210,7 @@ model RefreshToken {
 model LoginAttempt {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId    String?  @map("user_id") @db.Uuid // null si el email no existe
-  ipAddress String   @map("ip_address") @db.VarChar(45)
+  ipAddress String   @map("ip_address") @db.VarChar(255) // ancho generoso: con Cloudflare+Render delante, X-Forwarded-For puede traer varias IPs concatenadas
   email     String   @db.VarChar(255)
   success   Boolean
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
