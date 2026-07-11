@@ -25,6 +25,26 @@ export function startScheduler(): void {
 
   logger.info(`⏱  Polling iniciado: cada ${env.POLLING_INTERVAL_SECONDS}s`);
 
+  // ── 1b. Sincronización rápida — SOLO cambios de Alegra ────────────────────
+  // Independiente del polling principal. Detecta ventas/ajustes manuales
+  // hechos directamente en Alegra en segundos, sin esperar al ciclo lento.
+  const fastSyncIntervalMs = env.ALEGRA_FAST_SYNC_INTERVAL_SECONDS * 1000;
+  setInterval(async () => {
+    try {
+      const result = await orchestrator.fastAlegraSync();
+      if (result.errors.length > 0) {
+        logger.warn(`FastAlegraSync completado con ${result.errors.length} errores:`, result.errors);
+      } else if (result.changed > 0) {
+        logger.info(`FastAlegraSync: ${result.changed}/${result.checked} SKUs actualizados`);
+      }
+      // Sin cambios: no loguea nada, para no generar ruido cada 30s
+    } catch (err) {
+      logger.error('Error crítico en FastAlegraSync:', err);
+    }
+  }, fastSyncIntervalMs);
+
+  logger.info(`⚡  Sincronización rápida de Alegra iniciada: cada ${env.ALEGRA_FAST_SYNC_INTERVAL_SECONDS}s`);
+
   // ── 2. Heartbeat SSE — cada 30 segundos ──────────────────────────────────
   setInterval(() => {
     sseService.heartbeat();

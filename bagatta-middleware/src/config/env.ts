@@ -43,12 +43,19 @@ const envSchema = z.object({
   ALEGRA_WAREHOUSE_NAME:     z.string().default('Principal'),
   ALEGRA_UNIT_OF_MEASURE:    z.string().default('Unidad'),
 
+  // Cuentas contables opcionales — fallback manual cuando el bootstrap
+  // automático (getFirstActiveItem) no puede resolverlas desde un ítem
+  // existente en Alegra (ej. cuenta nueva sin productos creados aún).
   ALEGRA_INVENTORY_ACCOUNT_ID:   z.string().optional(),
   ALEGRA_SALE_COST_ACCOUNT_ID:   z.string().optional(),
   ALEGRA_SALE_INCOME_ACCOUNT_ID: z.string().optional(),
 
   // ── Sincronización ───────────────────────────────────────────────────────
   POLLING_INTERVAL_SECONDS:         z.coerce.number().default(10),
+  // Job separado y ligero, solo para detectar cambios hechos directamente en
+  // Alegra (el único caso que no puede llegar por webhook). No escala con el
+  // catálogo, así que puede correr mucho más seguido que POLLING_INTERVAL_SECONDS.
+  ALEGRA_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(30),
   CATCHUP_THRESHOLD_MINUTES:        z.coerce.number().default(2),
   DOWNTIME_ALERT_THRESHOLD_MINUTES: z.coerce.number().default(5),
   SELF_PING_INTERVAL_MINUTES:       z.coerce.number().default(10),

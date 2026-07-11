@@ -1461,6 +1461,128 @@ class OrchestratorCore {
   // ═══════════════════════════════════════════════════════════════════════════
   //  FORCE SYNC para un SKU específico (endpoint operador)
   // ═══════════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  SINCRONIZACIÓN RÁPIDA — SOLO CAMBIOS DE ALEGRA
+  //  A diferencia de runPollingCycle (que recorre TODO el catálogo llamando a
+  //  Shopify y Alegra por cada SKU, uno por uno), este job:
+  //   1. Trae TODOS los ítems de Alegra en pocas llamadas (paginado, ya
+  //      existente en getSyncedItems), no una llamada por SKU.
+  //   2. Compara en memoria contra el último stock conocido de Alegra.
+  //   3. Solo escribe a Shopify los SKUs que de verdad cambiaron — no todos.
+  //
+  //  Los cambios del lado de Shopify (ventas, ajustes manuales) YA son
+  //  instantáneos vía el webhook inventory_levels/update — este job cubre
+  //  el único caso que Alegra no puede avisarnos por sí solo: alguien
+  //  ajustó el stock directamente ahí, sin pasar por Shopify.
+  //
+  //  Por diseño puede correr cada 20-30s sin problema, incluso con miles de
+  //  SKUs, porque su costo NO escala con el catálogo — escala con cuántos
+  //  ítems trae cada página de Alegra (unas pocas llamadas fijas), no con
+  //  cuántos SKUs tengas registrados.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private isFastSyncing = false;
+
+  async fastAlegraSync(): Promise<{ checked: number; changed: number; errors: string[] }> {
+    const result = { checked: 0, changed: 0, errors: [] as string[] };
+
+    if (this.isFastSyncing) {
+      return result; // ya hay una corrida en curso, no solaparse a sí mismo
+    }
+    this.isFastSyncing = true;
+
+    try {
+      // ── 1. Traer TODOS los ítems de Alegra en bloque (pocas llamadas) ─────
+      const alegraItems = await alegraConnector.getSyncedItems();
+      const alegraStockByRef = new Map<string, number>();
+      for (const item of alegraItems) {
+        const ref = item.reference?.trim();
+        if (!ref) continue;
+        alegraStockByRef.set(ref, item.inventory?.warehouses?.[0]?.availableQuantity ?? 0);
+      }
+
+      // ── 2. Traer catálogo activo con su inventory conocido ────────────────
+      const catalog = await prisma.productCatalog.findMany({
+        where:   { status: 'active' },
+        include: { inventory: true },
+      });
+      result.checked = catalog.length;
+
+      // ── 3. Comparar en memoria — sin llamar a Alegra ni Shopify por SKU ───
+      for (const entry of catalog) {
+        if (!entry.inventory) continue;
+
+        const currentAlegra = alegraStockByRef.get(entry.sku);
+        if (currentAlegra === undefined) continue; // no está en Alegra (huérfano, ya cubierto aparte)
+
+        const deltaAlegra = entry.inventory.stockAlegraLast - currentAlegra;
+        if (deltaAlegra === 0) continue; // sin cambios — el caso común, no hace nada más
+
+        try {
+          const oldGlobal = entry.inventory.stockGlobal;
+          const newGlobal = Math.max(0, oldGlobal - deltaAlegra);
+
+          logger.info(
+              `[FastAlegraSync] SKU ${entry.sku}: cambio detectado en Alegra ` +
+              `(Δ=${deltaAlegra}) → nuevo stock global=${newGlobal}`,
+          );
+
+          await prisma.masterInventory.update({
+            where: { sku: entry.sku },
+            data:  {
+              stockGlobal:     newGlobal,
+              stockAlegraLast: newGlobal,
+              lastUpdated:     new Date(),
+              lastUpdatedBy:   'fast_alegra_sync',
+            },
+          });
+
+          // Escribir a Shopify solo si conocemos su inventory_item_id
+          // (backfill automático ya cubierto en reconcileSku). Si falla por
+          // falta de tracking (422) u otra causa, lo logueamos pero no
+          // abortamos — el registro en master_inventory ya quedó correcto,
+          // y el ciclo lento de seguridad lo puede corregir después si hace falta.
+          if (entry.shopifyInventoryItemId) {
+            try {
+              await shopifyConnector.setInventoryLevel(Number(entry.shopifyInventoryItemId), newGlobal);
+            } catch (shopifyErr) {
+              logger.warn(
+                  `[FastAlegraSync] SKU ${entry.sku}: no se pudo escribir a Shopify ` +
+                  `(¿sin "Track quantity"?): ${(shopifyErr as Error).message}`,
+              );
+            }
+          } else {
+            logger.warn(
+                `[FastAlegraSync] SKU ${entry.sku}: sin shopifyInventoryItemId todavía ` +
+                `(pendiente de backfill) — el ciclo lento lo completará.`,
+            );
+          }
+
+          await auditService.logStockChange({
+            sku:            entry.sku,
+            oldStock:       oldGlobal,
+            newStock:       newGlobal,
+            origin:         'orchestrator',
+            sourceEventRef: `fast_alegra_sync_${Date.now()}_${entry.sku}`,
+          });
+
+          result.changed++;
+        } catch (err) {
+          const msg = `[FastAlegraSync] Error procesando SKU ${entry.sku}: ${(err as Error).message}`;
+          logger.error(msg);
+          result.errors.push(msg);
+        }
+      }
+    } catch (err) {
+      const msg = `[FastAlegraSync] Error general: ${(err as Error).message}`;
+      logger.error(msg);
+      result.errors.push(msg);
+    } finally {
+      this.isFastSyncing = false;
+    }
+
+    return result;
+  }
+
   async forceSyncSku(sku: string): Promise<{
     before:       { stockGlobal: number; alegra: number; shopify: number };
     after:        { stockGlobal: number; alegra: number; shopify: number };
