@@ -11,8 +11,15 @@ import { TokenBucketLimiter } from '../../utils/rateLimiter';
 // lento (nunca se acerca a este límite), ajústalo aquí. No es un número
 // confirmado con la documentación oficial de Alegra, es un punto de partida
 // seguro dado lo que observamos bajo carga real.
-const alegraRateLimiter = new TokenBucketLimiter(3, 3);
-const MAX_ALEGRA_429_RETRIES = 3;
+// Alegra no publica un límite de tasa tan explícito como el de Shopify
+// (2 req/s documentado). Empezamos con 3 req/s como estimación conservadora,
+// pero evidencia real en producción (429 agotando los 3 reintentos) demostró
+// que el límite real de Alegra es más estricto. Bajado a 1 req/s SIN burst
+// (burst=1 fuerza espaciar cada request, no permitir ráfagas de varios de
+// golpe) — si ves que esto tampoco alcanza, baja más, o revisa si Alegra
+// documenta un límite oficial en su portal de desarrolladores.
+const alegraRateLimiter = new TokenBucketLimiter(1, 1);
+const MAX_ALEGRA_429_RETRIES = 5;
 
 class AlegraConnector {
   private client: AxiosInstance;
