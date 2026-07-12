@@ -1452,24 +1452,20 @@ class OrchestratorCore {
               `(Δ=${deltaAlegra}) → nuevo stock global=${newGlobal}`,
           );
 
-          await prisma.masterInventory.update({
-            where: { sku: entry.sku },
-            data:  {
-              stockGlobal:     newGlobal,
-              stockAlegraLast: newGlobal,
-              lastUpdated:     new Date(),
-              lastUpdatedBy:   'fast_alegra_sync',
-            },
-          });
+          // ── Escribir a Shopify PRIMERO, antes de tocar la base de datos ──────
+          // BUG CORREGIDO: antes se actualizaba stockShopifyLast=viejo (sin
+          // tocarlo) mientras SÍ se escribía el valor nuevo real en Shopify.
+          // Eso dejaba un "delta fantasma" acumulándose en stockShopifyLast,
+          // que el ciclo lento (reconcileSku) descubría después y reaplicaba
+          // como si fuera un cambio nuevo — restando unidades que nunca se
+          // vendieron. Ahora: solo marcamos stockShopifyLast como sincronizado
+          // si la escritura a Shopify realmente tuvo éxito.
+          let shopifyWriteOk = false;
 
-          // Escribir a Shopify solo si conocemos su inventory_item_id
-          // (backfill automático ya cubierto en reconcileSku). Si falla por
-          // falta de tracking (422) u otra causa, lo logueamos pero no
-          // abortamos — el registro en master_inventory ya quedó correcto,
-          // y el ciclo lento de seguridad lo puede corregir después si hace falta.
           if (entry.shopifyInventoryItemId) {
             try {
               await shopifyConnector.setInventoryLevel(Number(entry.shopifyInventoryItemId), newGlobal);
+              shopifyWriteOk = true;
             } catch (shopifyErr) {
               logger.warn(
                   `[FastAlegraSync] SKU ${entry.sku}: no se pudo escribir a Shopify ` +
@@ -1482,6 +1478,22 @@ class OrchestratorCore {
                 `(pendiente de backfill) — el ciclo lento lo completará.`,
             );
           }
+
+          await prisma.masterInventory.update({
+            where: { sku: entry.sku },
+            data:  {
+              stockGlobal:     newGlobal,
+              stockAlegraLast: newGlobal,
+              // Solo si la escritura a Shopify fue exitosa marcamos ese lado
+              // como sincronizado. Si falló o no se pudo escribir, dejamos el
+              // valor anterior — así el ciclo lento sabe que ese lado sigue
+              // pendiente de verdad, en vez de asumir un éxito que no ocurrió.
+              stockShopifyLast: shopifyWriteOk ? newGlobal : entry.inventory.stockShopifyLast,
+              lastUpdated:      new Date(),
+              lastUpdatedBy:    'fast_alegra_sync',
+            },
+          });
+
 
           await auditService.logStockChange({
             sku:            entry.sku,
