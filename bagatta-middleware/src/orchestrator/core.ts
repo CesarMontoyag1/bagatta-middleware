@@ -397,122 +397,26 @@ class OrchestratorCore {
     await prisma.syncState.update({ where: { id: 1 }, data: { status: 'catchup' } });
 
     try {
-      let skusReconciled = 0;
-
-      // ── Catchup rediseñado: comparación directa de stock actual ───────────
+      // ── Catchup simplificado: reutiliza fastAlegraSync (lectura en bloque) ──
       //
-      // El enfoque original usaba GET /orders.json para calcular deltas por
-      // órdenes, pero ese endpoint requiere aprobación especial de Shopify para
-      // "protected customer data" (error 403 en apps no aprobadas).
+      // Antes: recorría cada SKU secuencialmente llamando a Shopify 2 veces +
+      // Alegra 1 vez por cada uno — con cientos de SKUs esto reventaba el
+      // rate limit de Shopify (2 req/s) casi de inmediato, generando una
+      // tormenta de 429 que empeoraba mientras más SKUs había.
       //
-      // Solución equivalente y más robusta: leer el stock ACTUAL de cada
-      // plataforma y aplicar la misma fórmula de delta que usa el ciclo normal.
-      // El resultado es idéntico — si hubo ventas durante el downtime, el stock
-      // actual será menor que el _last guardado en master_inventory, y el delta
-      // se calcula igual:
-      //   delta_shopify = stock_shopify_last - stock_shopify_actual
-      //   delta_alegra  = stock_alegra_last  - stock_alegra_actual
-      //   stock_nuevo   = stock_global - delta_shopify - delta_alegra
-      //
-      // Esta estrategia no requiere permisos de órdenes ni datos de clientes.
+      // Ahora: el lado de Shopify NO necesita re-verificación manual durante
+      // el catchup, porque Shopify reintenta automáticamente los webhooks
+      // que no pudo entregar durante el downtime (hasta 48h de reintentos
+      // con backoff) — en cuanto el servidor vuelve a estar arriba, esos
+      // eventos perdidos llegan solos. Lo único que Alegra no puede avisarnos
+      // por sí solo son los cambios hechos ahí directamente durante la caída,
+      // y eso es exactamente lo que fastAlegraSync ya resuelve en bloque,
+      // sin importar cuántos SKUs tengas.
+      const fastResult = await this.fastAlegraSync();
+      const skusReconciled = fastResult.changed;
 
-      const catalog = await prisma.productCatalog.findMany({
-        where:   { status: 'active' },
-        include: { inventory: true },
-      });
-
-      for (const entry of catalog) {
-        if (!entry.inventory) continue;
-
-        const { sku, shopifyVariantId, alegraItemId } = entry;
-        const master = entry.inventory;
-
-        try {
-          // Leer stock actual en ambas plataformas (igual que reconcileSku)
-          const variantData            = await shopifyConnector.getVariant(shopifyVariantId);
-          const shopifyInventoryItemId = variantData.inventory_item_id;
-          const shopifyTracking        = variantData.inventory_management;
-          const currentShopify         = await shopifyConnector.getInventoryLevel(shopifyInventoryItemId);
-          const alegraItem     = await alegraConnector.getItem(alegraItemId);
-          const currentAlegra  = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
-
-          // ── Lógica de catchup basada en realidad, no en deltas ─────────────
-          //
-          // NO usamos stockAlegraLast/stockShopifyLast para calcular deltas en el
-          // catchup porque esos valores pueden estar desincronizados por:
-          //   - Ajustes de inventario que fallaron silenciosamente
-          //   - Reinicios de la BD o migraciones
-          //   - Vinculación de ítems existentes (donde _last queda en 0)
-          //
-          // En cambio, tomamos el stock REAL actual de cada plataforma y elegimos
-          // la fuente de verdad correcta según el contexto:
-          //   - Shopify con tracking → Shopify manda (es la plataforma de ventas)
-          //   - Sin tracking en Shopify → Alegra manda (es donde se gestiona el stock)
-          //   - Si ambos tienen stock diferente → tomar el mayor (evitar pérdida de stock)
-
-          let targetStock: number;
-
-          if (shopifyTracking === 'shopify') {
-            // Shopify tiene tracking activo → es la fuente de verdad para stock
-            targetStock = currentShopify;
-          } else {
-            // Sin tracking en Shopify → Alegra es fuente de verdad
-            targetStock = currentAlegra;
-          }
-
-          const oldGlobal = master.stockGlobal;
-
-          // Si el master ya coincide con el target Y Alegra ya lo tiene correcto → skip
-          if (oldGlobal === targetStock && currentAlegra === targetStock) {
-            continue;
-          }
-
-          logger.info(
-              `Catchup SKU ${sku}: Shopify=${currentShopify} Alegra=${currentAlegra} ` +
-              `master=${oldGlobal} → target=${targetStock}`,
-          );
-
-          // Actualizar master con la realidad
-          await prisma.masterInventory.update({
-            where: { sku },
-            data: {
-              stockGlobal:      targetStock,
-              stockShopifyLast: shopifyTracking === 'shopify' ? currentShopify : targetStock,
-              stockAlegraLast:  targetStock,
-              lastUpdatedBy:    'catchup_sync',
-            },
-          });
-
-          // Sincronizar Shopify si tiene tracking y difiere del target
-          if (shopifyTracking === 'shopify' && currentShopify !== targetStock) {
-            await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, targetStock);
-          }
-
-          // Sincronizar Alegra si difiere del target
-          if (currentAlegra !== targetStock) {
-            const adjustQty = targetStock - currentAlegra;
-            logger.info(`Catchup: ajustando Alegra ítem ${entry.alegraItemId}: ${currentAlegra} → ${targetStock} (delta=${adjustQty})`);
-            await alegraConnector.adjustStock(
-                entry.alegraItemId,
-                adjustQty,
-                `Catchup sync — alineando con stock real (${currentAlegra} → ${targetStock})`,
-                entry.lastKnownCost.toNumber(),  // preservar costo promedio en Alegra
-            );
-          }
-
-          await auditService.logStockChange({
-            sku,
-            oldStock:       master.stockGlobal,
-            newStock:       targetStock,
-            origin:         'catchup_sync',
-            sourceEventRef: `catchup_${since.toISOString()}`,
-          });
-
-          skusReconciled++;
-        } catch (skuErr) {
-          logger.error(`Catchup: error reconciliando SKU ${sku}:`, skuErr);
-          // Continuar con el siguiente SKU — no abortar todo el catchup por uno
-        }
+      if (fastResult.errors.length > 0) {
+        logger.warn(`Catchup: fastAlegraSync completó con ${fastResult.errors.length} errores`, fastResult.errors);
       }
 
       // ── 4. Alerta si el downtime fue significativo ─────────────────────────
@@ -1480,15 +1384,37 @@ class OrchestratorCore {
   //  ítems trae cada página de Alegra (unas pocas llamadas fijas), no con
   //  cuántos SKUs tengas registrados.
   // ═══════════════════════════════════════════════════════════════════════════
-  private isFastSyncing = false;
+  // Antes: un simple booleano (isFastSyncing) hacía que una segunda llamada
+  // mientras ya había una corrida en curso devolviera un resultado vacío de
+  // inmediato (silencioso "no-op") — esto era un problema real si, por
+  // ejemplo, el catchup se disparaba justo cuando la corrida periódica de
+  // cada 30s ya estaba en curso: el catchup creería que ya reconcilió todo,
+  // sin haber hecho nada en realidad.
+  //
+  // Ahora: se usa una promesa compartida. Si ya hay una corrida en curso,
+  // cualquier llamada nueva espera a que termine esa, y luego dispara una
+  // corrida propia — así SIEMPRE se obtiene un resultado real, nunca uno
+  // vacío por coincidencia de tiempos.
+  private fastSyncInFlight: Promise<{ checked: number; changed: number; errors: string[] }> | null = null;
 
   async fastAlegraSync(): Promise<{ checked: number; changed: number; errors: string[] }> {
-    const result = { checked: 0, changed: 0, errors: [] as string[] };
-
-    if (this.isFastSyncing) {
-      return result; // ya hay una corrida en curso, no solaparse a sí mismo
+    if (this.fastSyncInFlight) {
+      // Esperar a que termine la corrida actual (ignorando si falló, para no
+      // propagar un error ajeno a este llamador) y luego correr una propia.
+      await this.fastSyncInFlight.catch(() => undefined);
+      return this.fastAlegraSync();
     }
-    this.isFastSyncing = true;
+
+    this.fastSyncInFlight = this.runFastAlegraSyncOnce();
+    try {
+      return await this.fastSyncInFlight;
+    } finally {
+      this.fastSyncInFlight = null;
+    }
+  }
+
+  private async runFastAlegraSyncOnce(): Promise<{ checked: number; changed: number; errors: string[] }> {
+    const result = { checked: 0, changed: 0, errors: [] as string[] };
 
     try {
       // ── 1. Traer TODOS los ítems de Alegra en bloque (pocas llamadas) ─────
@@ -1576,8 +1502,6 @@ class OrchestratorCore {
       const msg = `[FastAlegraSync] Error general: ${(err as Error).message}`;
       logger.error(msg);
       result.errors.push(msg);
-    } finally {
-      this.isFastSyncing = false;
     }
 
     return result;
