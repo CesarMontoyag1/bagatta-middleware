@@ -1564,6 +1564,138 @@ class OrchestratorCore {
     return result;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  SINCRONIZACIÓN RÁPIDA — SOLO CAMBIOS DE SHOPIFY
+  //  Simétrico a fastAlegraSync: en vez de depender de que Shopify nos avise
+  //  por webhook (que requiere suscripción manual y puede fallar en silencio),
+  //  este job PREGUNTA activamente por el stock real de todos los SKUs en
+  //  bloque (hasta 250 inventory_item_ids por request), y solo escribe a
+  //  Alegra los SKUs que de verdad cambiaron.
+  //
+  //  Con esto, ninguno de los dos lados depende de webhooks para mantenerse
+  //  al día — ambos se preguntan activamente, cada 30s, sin configuración
+  //  manual adicional. Los webhooks (si están registrados) siguen ayudando a
+  //  que la reacción sea aún más instantánea, pero ya no son un requisito.
+  // ═══════════════════════════════════════════════════════════════════════════
+  private fastShopifySyncInFlight: Promise<{ checked: number; changed: number; errors: string[] }> | null = null;
+
+  async fastShopifySync(): Promise<{ checked: number; changed: number; errors: string[] }> {
+    if (this.fastShopifySyncInFlight) {
+      await this.fastShopifySyncInFlight.catch(() => undefined);
+      return this.fastShopifySync();
+    }
+
+    this.fastShopifySyncInFlight = this.runFastShopifySyncOnce();
+    try {
+      return await this.fastShopifySyncInFlight;
+    } finally {
+      this.fastShopifySyncInFlight = null;
+    }
+  }
+
+  private async runFastShopifySyncOnce(): Promise<{ checked: number; changed: number; errors: string[] }> {
+    const result = { checked: 0, changed: 0, errors: [] as string[] };
+
+    try {
+      // ── 1. Traer catálogo activo con su inventory conocido ────────────────
+      const catalog = await prisma.productCatalog.findMany({
+        where:   { status: 'active' },
+        include: { inventory: true },
+      });
+      result.checked = catalog.length;
+
+      const withInventoryItemId = catalog.filter((e: typeof catalog[number]) => e.shopifyInventoryItemId);
+      if (withInventoryItemId.length === 0) return result;
+
+      // ── 2. Traer TODOS los niveles de Shopify en bloque (pocas llamadas) ──
+      const inventoryItemIds = withInventoryItemId.map((e: typeof catalog[number]) => Number(e.shopifyInventoryItemId));
+      const shopifyStockById = await shopifyConnector.getInventoryLevelsBulk(inventoryItemIds);
+
+      // ── 3. Comparar en memoria — sin llamar a Shopify por SKU ─────────────
+      for (const entry of withInventoryItemId) {
+        if (!entry.inventory) continue;
+
+        const currentShopify = shopifyStockById.get(Number(entry.shopifyInventoryItemId));
+        if (currentShopify === undefined) continue; // sin nivel reportado — se deja para el ciclo lento
+
+        const deltaShopifyPreview = entry.inventory.stockShopifyLast - currentShopify;
+        if (deltaShopifyPreview === 0) continue;
+
+        try {
+          const didChange = await this.skuMutex.runExclusive(entry.sku, async (): Promise<boolean> => {
+            // Releer fresco DENTRO del candado — mismo motivo que en fastAlegraSync:
+            // evitar sobrescribir una corrección concurrente con una lectura vieja.
+            const fresh = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
+            if (!fresh) return false;
+
+            const deltaShopify = fresh.stockShopifyLast - currentShopify;
+            if (deltaShopify === 0) return false; // otro proceso ya lo dejó al día
+
+            const oldGlobal = fresh.stockGlobal;
+            const newGlobal = Math.max(0, oldGlobal - deltaShopify);
+
+            logger.info(
+                `[FastShopifySync] SKU ${entry.sku}: cambio detectado en Shopify ` +
+                `(Δ=${deltaShopify}) → nuevo stock global=${newGlobal}`,
+            );
+
+            // ── Escribir a Alegra PRIMERO, y solo marcar stockAlegraLast como
+            // sincronizado si esa escritura tuvo éxito real (mismo cuidado que
+            // el bug que corregimos del lado de fastAlegraSync).
+            let alegraWriteOk = false;
+            try {
+              await alegraConnector.adjustStock(
+                  entry.alegraItemId,
+                  -deltaShopify, // si Shopify bajó (delta>0), Alegra debe bajar también
+                  `FastShopifySync — venta/ajuste detectado en Shopify`,
+                  entry.lastKnownCost.toNumber(),
+              );
+              alegraWriteOk = true;
+            } catch (alegraErr) {
+              logger.warn(
+                  `[FastShopifySync] SKU ${entry.sku}: no se pudo escribir a Alegra: ` +
+                  `${(alegraErr as Error).message}`,
+              );
+            }
+
+            await prisma.masterInventory.update({
+              where: { sku: entry.sku },
+              data:  {
+                stockGlobal:      newGlobal,
+                stockShopifyLast: newGlobal,
+                stockAlegraLast:  alegraWriteOk ? newGlobal : fresh.stockAlegraLast,
+                lastUpdated:      new Date(),
+                lastUpdatedBy:    'fast_shopify_sync',
+              },
+            });
+
+            await auditService.logStockChange({
+              sku:            entry.sku,
+              oldStock:       oldGlobal,
+              newStock:       newGlobal,
+              origin:         'orchestrator',
+              sourceEventRef: `fast_shopify_sync_${Date.now()}_${entry.sku}`,
+            });
+
+            return true;
+          });
+
+          if (didChange) result.changed++;
+        } catch (err) {
+          const msg = `[FastShopifySync] Error procesando SKU ${entry.sku}: ${(err as Error).message}`;
+          logger.error(msg);
+          result.errors.push(msg);
+        }
+      }
+    } catch (err) {
+      const msg = `[FastShopifySync] Error general: ${(err as Error).message}`;
+      logger.error(msg);
+      result.errors.push(msg);
+    }
+
+    return result;
+  }
+
   async forceSyncSku(sku: string): Promise<{
     before:       { stockGlobal: number; alegra: number; shopify: number };
     after:        { stockGlobal: number; alegra: number; shopify: number };

@@ -56,6 +56,9 @@ const envSchema = z.object({
   // Alegra (el único caso que no puede llegar por webhook). No escala con el
   // catálogo, así que puede correr mucho más seguido que POLLING_INTERVAL_SECONDS.
   ALEGRA_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(30),
+  // Simétrico al de Alegra — no depende de webhooks registrados, pregunta
+  // activamente el stock de Shopify en bloque cada cierto tiempo.
+  SHOPIFY_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(30),
   CATCHUP_THRESHOLD_MINUTES:        z.coerce.number().default(2),
   DOWNTIME_ALERT_THRESHOLD_MINUTES: z.coerce.number().default(5),
   SELF_PING_INTERVAL_MINUTES:       z.coerce.number().default(10),

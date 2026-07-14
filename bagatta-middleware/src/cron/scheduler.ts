@@ -45,6 +45,25 @@ export function startScheduler(): void {
 
   logger.info(`⚡  Sincronización rápida de Alegra iniciada: cada ${env.ALEGRA_FAST_SYNC_INTERVAL_SECONDS}s`);
 
+  // ── 1c. Sincronización rápida — SOLO cambios de Shopify ───────────────────
+  // Simétrico al job de Alegra. No depende de que los webhooks de Shopify
+  // estén registrados — pregunta activamente por el stock real en bloque.
+  const shopifyFastSyncIntervalMs = env.SHOPIFY_FAST_SYNC_INTERVAL_SECONDS * 1000;
+  setInterval(async () => {
+    try {
+      const result = await orchestrator.fastShopifySync();
+      if (result.errors.length > 0) {
+        logger.warn(`FastShopifySync completado con ${result.errors.length} errores:`, result.errors);
+      } else if (result.changed > 0) {
+        logger.info(`FastShopifySync: ${result.changed}/${result.checked} SKUs actualizados`);
+      }
+    } catch (err) {
+      logger.error('Error crítico en FastShopifySync:', err);
+    }
+  }, shopifyFastSyncIntervalMs);
+
+  logger.info(`⚡  Sincronización rápida de Shopify iniciada: cada ${env.SHOPIFY_FAST_SYNC_INTERVAL_SECONDS}s`);
+
   // ── 2. Heartbeat SSE — cada 30 segundos ──────────────────────────────────
   setInterval(() => {
     sseService.heartbeat();

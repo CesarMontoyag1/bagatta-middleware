@@ -128,6 +128,33 @@ class ShopifyConnector {
    * Si no encuentra nivel en esa location, busca en TODAS las locations y
    * actualiza el bootstrap con el location_id correcto automáticamente.
    */
+  // Trae niveles de inventario de MUCHOS inventory_item_ids en pocas llamadas
+  // (hasta 250 por request, límite de Shopify) — usado por FastShopifySync
+  // para no tener que preguntar SKU por SKU.
+  async getInventoryLevelsBulk(inventoryItemIds: number[]): Promise<Map<number, number>> {
+    this.assertTokenValid();
+    const locationId = getShopifyLocationId();
+    const result = new Map<number, number>();
+
+    const CHUNK_SIZE = 250;
+    for (let i = 0; i < inventoryItemIds.length; i += CHUNK_SIZE) {
+      const chunk = inventoryItemIds.slice(i, i + CHUNK_SIZE);
+      const { data } = await this.getClient().get('/inventory_levels.json', {
+        params: {
+          inventory_item_ids: chunk.join(','),
+          location_ids:       locationId,
+          limit:              250,
+        },
+      });
+      const levels = (data.inventory_levels ?? []) as ShopifyInventoryLevel[];
+      for (const level of levels) {
+        result.set(level.inventory_item_id, level.available);
+      }
+    }
+
+    return result;
+  }
+
   async getInventoryLevel(inventoryItemId: number): Promise<number> {
     this.assertTokenValid();
     const locationId = getShopifyLocationId();
