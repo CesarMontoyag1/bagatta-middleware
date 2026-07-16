@@ -16,6 +16,7 @@ import { TokenBucketLimiter } from '../../utils/rateLimiter';
 const shopifyRateLimiter = new TokenBucketLimiter(2, 2);
 
 const MAX_429_RETRIES = 3;
+const MAX_NETWORK_RETRIES = 3; // timeouts, ECONNRESET, DNS, etc. — antes nunca se reintentaban
 
 class ShopifyConnector {
   private baseURL: string;
@@ -60,6 +61,35 @@ class ShopifyConnector {
           const url    = err.config?.url;
           const data   = err.response?.data;
 
+          // ── Error de RED (sin respuesta HTTP) — timeout, conexión reseteada,
+          // DNS, etc. Antes esto se logueaba como "status undefined, data {}"
+          // sin información útil, y nunca se reintentaba (el retry solo
+          // cubría 429). Ahora: reintenta con backoff igual que un 429, y
+          // loguea el código real del error de red (ECONNRESET, ETIMEDOUT...).
+          if (!err.response) {
+            const cfg = err.config as (typeof err.config & { __netRetryCount?: number });
+            const retryCount = cfg?.__netRetryCount ?? 0;
+
+            logger.warn(
+                `Shopify: error de red en ${url} — código=${err.code ?? 'desconocido'} ` +
+                `mensaje="${err.message || '(sin mensaje)'}"`,
+            );
+
+            if (cfg && retryCount < MAX_NETWORK_RETRIES) {
+              const waitMs = 1000 * Math.pow(2, retryCount); // 1s, 2s, 4s...
+              logger.warn(`Shopify: reintentando ${url} en ${waitMs}ms (${retryCount + 1}/${MAX_NETWORK_RETRIES})`);
+              cfg.__netRetryCount = retryCount + 1;
+              await new Promise((resolve) => setTimeout(resolve, waitMs));
+              return client.request(cfg);
+            }
+
+            logger.error(
+                `Shopify: error de red persistente en ${url} tras ${MAX_NETWORK_RETRIES} reintentos ` +
+                `— código=${err.code ?? 'desconocido'}`,
+            );
+            throw err;
+          }
+
           // ── 429: reintentar con backoff, respetando Retry-After si viene ──
           if (status === 429) {
             const cfg = err.config as (typeof err.config & { __retryCount?: number });
@@ -90,7 +120,7 @@ class ShopifyConnector {
             shopifyTokenManager.markInvalid();
             logger.error(`Shopify 401 en ${url} — token inválido`, { data });
           } else {
-            logger.error(`Shopify API error ${status} en ${url}`, { data });
+            logger.error(`Shopify API error ${status} en ${url} — mensaje="${err.message}"`, { data });
           }
           throw err;
         },
@@ -139,16 +169,30 @@ class ShopifyConnector {
     const CHUNK_SIZE = 250;
     for (let i = 0; i < inventoryItemIds.length; i += CHUNK_SIZE) {
       const chunk = inventoryItemIds.slice(i, i + CHUNK_SIZE);
-      const { data } = await this.getClient().get('/inventory_levels.json', {
-        params: {
-          inventory_item_ids: chunk.join(','),
-          location_ids:       locationId,
-          limit:              250,
-        },
-      });
-      const levels = (data.inventory_levels ?? []) as ShopifyInventoryLevel[];
-      for (const level of levels) {
-        result.set(level.inventory_item_id, level.available);
+
+      // Cada página se aísla: si una falla (incluso tras los reintentos del
+      // interceptor), NO debe tumbar la corrida completa — las demás páginas
+      // (y por tanto los demás SKUs) siguen procesándose. La página fallida
+      // simplemente queda para el siguiente tick (30s después) o el ciclo
+      // lento de seguridad.
+      try {
+        const { data } = await this.getClient().get('/inventory_levels.json', {
+          params: {
+            inventory_item_ids: chunk.join(','),
+            location_ids:       locationId,
+            limit:              250,
+          },
+        });
+        const levels = (data.inventory_levels ?? []) as ShopifyInventoryLevel[];
+        for (const level of levels) {
+          result.set(level.inventory_item_id, level.available);
+        }
+      } catch (err) {
+        logger.error(
+            `getInventoryLevelsBulk: página ${i / CHUNK_SIZE + 1} falló ` +
+            `(${chunk.length} SKUs omitidos en este tick) — ${(err as Error).message}`,
+        );
+        // No relanzar — seguir con la siguiente página
       }
     }
 

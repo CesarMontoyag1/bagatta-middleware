@@ -20,6 +20,7 @@ import { TokenBucketLimiter } from '../../utils/rateLimiter';
 // documenta un límite oficial en su portal de desarrolladores.
 const alegraRateLimiter = new TokenBucketLimiter(1, 1);
 const MAX_ALEGRA_429_RETRIES = 5;
+const MAX_ALEGRA_NETWORK_RETRIES = 3;
 
 class AlegraConnector {
   private client: AxiosInstance;
@@ -49,6 +50,32 @@ class AlegraConnector {
           const status = err.response?.status;
           const url    = err.config?.url;
 
+          // ── Error de RED (sin respuesta HTTP) — ej. el ECONNRESET que vimos
+          // en el ítem 465. Antes no se reintentaba nunca (solo 429 lo hacía).
+          if (!err.response) {
+            const cfg = err.config as (typeof err.config & { __netRetryCount?: number });
+            const retryCount = cfg?.__netRetryCount ?? 0;
+
+            logger.warn(
+                `Alegra: error de red en ${url} — código=${err.code ?? 'desconocido'} ` +
+                `mensaje="${err.message || '(sin mensaje)'}"`,
+            );
+
+            if (cfg && retryCount < MAX_ALEGRA_NETWORK_RETRIES) {
+              const waitMs = 1000 * Math.pow(2, retryCount);
+              logger.warn(`Alegra: reintentando ${url} en ${waitMs}ms (${retryCount + 1}/${MAX_ALEGRA_NETWORK_RETRIES})`);
+              cfg.__netRetryCount = retryCount + 1;
+              await new Promise((resolve) => setTimeout(resolve, waitMs));
+              return this.client.request(cfg);
+            }
+
+            logger.error(
+                `Alegra: error de red persistente en ${url} tras ${MAX_ALEGRA_NETWORK_RETRIES} reintentos ` +
+                `— código=${err.code ?? 'desconocido'}`,
+            );
+            throw err;
+          }
+
           if (status === 429) {
             const cfg = err.config as (typeof err.config & { __retryCount?: number });
             const retryCount = cfg?.__retryCount ?? 0;
@@ -68,7 +95,7 @@ class AlegraConnector {
             }
           }
 
-          logger.error(`Alegra API error ${status} en ${url}`, { data: err.response?.data });
+          logger.error(`Alegra API error ${status} en ${url} — mensaje="${err.message}"`, { data: err.response?.data });
           throw err;
         },
     );
