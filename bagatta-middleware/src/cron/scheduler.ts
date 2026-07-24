@@ -5,8 +5,25 @@ import { sseService } from '../services/sse';
 import { prisma } from '../db/prisma';
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
+import { catalogCache } from '../services/catalogCache';
 
 export function startScheduler(): void {
+  // ── 0. Cargar la caché de catálogo ANTES de arrancar los ciclos rápidos ───
+  // Los ciclos rápidos (1b, 1c) la consultan en memoria en vez de ir a
+  // Supabase cada vez — esto es lo que resuelve el problema de egress.
+  // El primer tick de los ciclos rápidos es 30-60s después de arrancar,
+  // tiempo de sobra para que este refresco inicial (async, no bloqueante)
+  // termine antes de que se necesite.
+  catalogCache.refresh().catch((err) => logger.error('Error cargando CatalogCache inicial:', err));
+
+  // Refresco periódico de seguridad — por si algo cambió sin pasar por los
+  // puntos que actualizan la caché en tiempo real (upsert/remove directos).
+  const cacheRefreshMs = env.CATALOG_CACHE_REFRESH_MINUTES * 60_000;
+  setInterval(() => {
+    catalogCache.refresh().catch((err) => logger.error('Error refrescando CatalogCache:', err));
+  }, cacheRefreshMs);
+  logger.info(`🗂️   CatalogCache: refresco de seguridad cada ${env.CATALOG_CACHE_REFRESH_MINUTES} min`);
+
   // ── 1. Polling principal — cada 10 segundos ───────────────────────────────
   // node-cron mínimo es 1 minuto. Usamos setInterval para frecuencias menores.
   const intervalMs = env.POLLING_INTERVAL_SECONDS * 1000;

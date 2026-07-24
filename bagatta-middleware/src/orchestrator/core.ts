@@ -10,6 +10,7 @@ import { AlegraItemCreatePayload, SyncCycleResult, ShopifyProduct } from '../typ
 import { buildIdempotencyKey } from '../utils/idempotency';
 import { mapWithConcurrency } from '../utils/concurrency';
 import { KeyedMutex } from '../utils/keyedMutex';
+import { catalogCache } from '../services/catalogCache';
 
 class OrchestratorCore {
   private isSyncing   = false;
@@ -250,6 +251,11 @@ class OrchestratorCore {
         where: { sku },
         data:  { shopifyInventoryItemId: String(shopifyInventoryItemId) },
       }).catch((err: Error) => logger.warn(`Backfill shopifyInventoryItemId falló para SKU ${sku}: ${err.message}`));
+
+      const cached = catalogCache.get(sku);
+      if (cached) {
+        catalogCache.upsert({ ...cached, shopifyInventoryItemId: String(shopifyInventoryItemId) });
+      }
     }
 
     // ── 2. Calcular deltas REALES (no snapshot comparison) ────────────────
@@ -782,6 +788,15 @@ class OrchestratorCore {
           },
         });
 
+        // Reflejar de inmediato en la caché — así fastAlegraSync/fastShopifySync
+        // ya lo detectan en su próximo tick (30-60s), sin esperar hasta 15 min.
+        catalogCache.upsert({
+          sku:                    variant.sku,
+          shopifyInventoryItemId: String(variant.inventory_item_id),
+          alegraItemId:           String(alegraItem.id),
+          lastKnownCost:          cost,
+        });
+
         // ── Insertar en master_inventory ──────────────────────────────────
         // Si vinculamos a un ítem existente, usar el stock REAL que ya tiene
         // en Alegra (no el de Shopify) para no sobreescribir lo existente.
@@ -956,6 +971,16 @@ class OrchestratorCore {
           where: { shopifyVariantId: String(variant.id) },
           data:  updates,
         });
+
+        // Si cambió el costo, reflejarlo en la caché al instante — si no,
+        // fastShopifySync seguiría usando el costo viejo al ajustar Alegra
+        // hasta el próximo refresco de 15 min.
+        if (updates.lastKnownCost !== undefined) {
+          const cached = catalogCache.get(currentSku);
+          if (cached) {
+            catalogCache.upsert({ ...cached, lastKnownCost: updates.lastKnownCost as number });
+          }
+        }
       }
     }
   }
@@ -1052,6 +1077,10 @@ class OrchestratorCore {
       where: { id: catalog.id },
       data:  { status: 'archived' },
     });
+
+    // Sacarlo de la caché al instante — si no, fastAlegraSync/fastShopifySync
+    // seguirían intentando reconciliarlo hasta el próximo refresco de 15 min.
+    catalogCache.remove(catalog.sku);
 
     const archKey = buildIdempotencyKey(
         'shopify_webhook',
@@ -1451,16 +1480,29 @@ class OrchestratorCore {
         alegraStockByRef.set(ref, item.inventory?.warehouses?.[0]?.availableQuantity ?? 0);
       }
 
-      // ── 2. Traer catálogo activo con su inventory conocido ────────────────
-      const catalog = await prisma.productCatalog.findMany({
-        where:   { status: 'active' },
-        include: { inventory: true },
+      // ── 2. Metadata del catálogo — desde la caché en memoria, NO de Supabase ──
+      // Antes: esta función consultaba product_catalog cada 60s para los 507
+      // SKUs. Con catalogCache, el SKU y shopifyInventoryItemId (que casi
+      // nunca cambian) ya viven en memoria — solo se refrescan cada 15 min o
+      // al crear/archivar un producto. Aquí solo consultamos master_inventory
+      // (el único dato que sí cambia seguido), y con el select más mínimo
+      // posible: sku + un entero.
+      const catalogEntries = catalogCache.getAll();
+      if (catalogEntries.length === 0) return result; // caché aún no cargada (arranque reciente)
+
+      const stockRows = await prisma.masterInventory.findMany({
+        select: { sku: true, stockAlegraLast: true },
       });
-      result.checked = catalog.length;
+      const stockAlegraLastBySku = new Map<string, number>(
+          stockRows.map((r: { sku: string; stockAlegraLast: number }) => [r.sku, r.stockAlegraLast]),
+      );
+
+      result.checked = catalogEntries.length;
 
       // ── 3. Comparar en memoria — sin llamar a Alegra ni Shopify por SKU ───
-      for (const entry of catalog) {
-        if (!entry.inventory) continue;
+      for (const entry of catalogEntries) {
+        const knownAlegraStock = stockAlegraLastBySku.get(entry.sku);
+        if (knownAlegraStock === undefined) continue; // aún sin fila de inventory
 
         const currentAlegra = alegraStockByRef.get(entry.sku);
         if (currentAlegra === undefined) continue; // no está en Alegra (huérfano, ya cubierto aparte)
@@ -1468,7 +1510,7 @@ class OrchestratorCore {
         // Pre-filtro barato usando la instantánea del inicio del ciclo — si acá
         // ya sugiere "sin cambios", casi seguro es así. El cálculo real y
         // definitivo ocurre DENTRO del candado, con una lectura fresca.
-        const deltaAlegraPreview = entry.inventory.stockAlegraLast - currentAlegra;
+        const deltaAlegraPreview = knownAlegraStock - currentAlegra;
         if (deltaAlegraPreview === 0) continue;
 
         try {
@@ -1597,28 +1639,37 @@ class OrchestratorCore {
     const result = { checked: 0, changed: 0, errors: [] as string[] };
 
     try {
-      // ── 1. Traer catálogo activo con su inventory conocido ────────────────
-      const catalog = await prisma.productCatalog.findMany({
-        where:   { status: 'active' },
-        include: { inventory: true },
-      });
-      result.checked = catalog.length;
+      // ── 1. Metadata del catálogo — desde la caché en memoria, NO de Supabase ──
+      // Igual razonamiento que en fastAlegraSync: sku, shopifyInventoryItemId,
+      // alegraItemId y lastKnownCost casi nunca cambian — viven en memoria.
+      const catalogEntries = catalogCache.getAll();
+      if (catalogEntries.length === 0) return result; // caché aún no cargada (arranque reciente)
 
-      const withInventoryItemId = catalog.filter((e: typeof catalog[number]) => e.shopifyInventoryItemId);
+      const withInventoryItemId = catalogEntries.filter((e) => e.shopifyInventoryItemId);
       if (withInventoryItemId.length === 0) return result;
 
+      const stockRows = await prisma.masterInventory.findMany({
+        select: { sku: true, stockShopifyLast: true },
+      });
+      const stockShopifyLastBySku = new Map<string, number>(
+          stockRows.map((r: { sku: string; stockShopifyLast: number }) => [r.sku, r.stockShopifyLast]),
+      );
+
+      result.checked = catalogEntries.length;
+
       // ── 2. Traer TODOS los niveles de Shopify en bloque (pocas llamadas) ──
-      const inventoryItemIds = withInventoryItemId.map((e: typeof catalog[number]) => Number(e.shopifyInventoryItemId));
+      const inventoryItemIds = withInventoryItemId.map((e) => Number(e.shopifyInventoryItemId));
       const shopifyStockById = await shopifyConnector.getInventoryLevelsBulk(inventoryItemIds);
 
       // ── 3. Comparar en memoria — sin llamar a Shopify por SKU ─────────────
       for (const entry of withInventoryItemId) {
-        if (!entry.inventory) continue;
+        const knownShopifyStock = stockShopifyLastBySku.get(entry.sku);
+        if (knownShopifyStock === undefined) continue; // aún sin fila de inventory
 
         const currentShopify = shopifyStockById.get(Number(entry.shopifyInventoryItemId));
         if (currentShopify === undefined) continue; // sin nivel reportado — se deja para el ciclo lento
 
-        const deltaShopifyPreview = entry.inventory.stockShopifyLast - currentShopify;
+        const deltaShopifyPreview = knownShopifyStock - currentShopify;
         if (deltaShopifyPreview === 0) continue;
 
         try {
@@ -1648,7 +1699,7 @@ class OrchestratorCore {
                   entry.alegraItemId,
                   -deltaShopify, // si Shopify bajó (delta>0), Alegra debe bajar también
                   `FastShopifySync — venta/ajuste detectado en Shopify`,
-                  entry.lastKnownCost.toNumber(),
+                  entry.lastKnownCost,
               );
               alegraWriteOk = true;
             } catch (alegraErr) {

@@ -55,10 +55,18 @@ const envSchema = z.object({
   // Job separado y ligero, solo para detectar cambios hechos directamente en
   // Alegra (el único caso que no puede llegar por webhook). No escala con el
   // catálogo, así que puede correr mucho más seguido que POLLING_INTERVAL_SECONDS.
-  ALEGRA_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(30),
+  // Antes en 30s: sumado a las columnas de más que se traían por fila, esto
+  // disparó el egress de Supabase a 147% del plan free en 5 días. Con el
+  // select ya recortado, 60s sigue siendo casi tan reactivo pero a mitad de
+  // consultas/día.
+  ALEGRA_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(60),
   // Simétrico al de Alegra — no depende de webhooks registrados, pregunta
   // activamente el stock de Shopify en bloque cada cierto tiempo.
-  SHOPIFY_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(30),
+  SHOPIFY_FAST_SYNC_INTERVAL_SECONDS: z.coerce.number().default(60),
+  // Refresco de seguridad de la caché en memoria del catálogo (IDs, costo).
+  // Cambios propios (producto nuevo, archivado, costo editado) actualizan
+  // la caché al instante — esto es solo la red de seguridad para lo demás.
+  CATALOG_CACHE_REFRESH_MINUTES: z.coerce.number().default(15),
   CATCHUP_THRESHOLD_MINUTES:        z.coerce.number().default(2),
   DOWNTIME_ALERT_THRESHOLD_MINUTES: z.coerce.number().default(5),
   SELF_PING_INTERVAL_MINUTES:       z.coerce.number().default(10),
