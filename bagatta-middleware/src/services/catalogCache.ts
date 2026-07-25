@@ -25,6 +25,7 @@ import { logger } from '../utils/logger';
 export interface CatalogCacheEntry {
     sku:                     string;
     shopifyInventoryItemId:  string | null;
+    shopifyVariantId:        string;
     alegraItemId:            string;
     lastKnownCost:           number;
 }
@@ -40,6 +41,7 @@ class CatalogCache {
             select: {
                 sku:                    true,
                 shopifyInventoryItemId: true,
+                shopifyVariantId:       true,
                 alegraItemId:           true,
                 lastKnownCost:          true,
             },
@@ -50,6 +52,7 @@ class CatalogCache {
             next.set(row.sku, {
                 sku:                    row.sku,
                 shopifyInventoryItemId: row.shopifyInventoryItemId,
+                shopifyVariantId:       row.shopifyVariantId,
                 alegraItemId:           row.alegraItemId,
                 lastKnownCost:          row.lastKnownCost.toNumber(),
             });

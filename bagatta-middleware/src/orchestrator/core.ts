@@ -227,13 +227,18 @@ class OrchestratorCore {
       stockShopifyLast: number;
     } | null;
   }): Promise<boolean> {
-    if (!entry.inventory) return false;
-
     const { sku, shopifyVariantId, alegraItemId } = entry;
-    const master = entry.inventory;
     let anyChange = false;
 
-    // ── 1. Obtener stock actual en ambas plataformas ───────────────────────
+    // ── 1. Releer el master fresco dentro del candado ──────────────────────
+    // forceSyncSku y el polling pueden entrar con snapshots viejos; si usamos
+    // entry.inventory tal cual, un webhook concurrente puede reaplicar el mismo
+    // delta y descontar dos veces. El estado correcto se toma aquí, ya dentro
+    // del mutex por SKU.
+    const master = await prisma.masterInventory.findUnique({ where: { sku } });
+    if (!master) return false;
+
+    // ── 2. Obtener stock actual en ambas plataformas ───────────────────────
     // getVariant devuelve inventory_item_id e inventory_management en una sola llamada
     const variantData            = await shopifyConnector.getVariant(shopifyVariantId);
     const shopifyInventoryItemId = variantData.inventory_item_id;
@@ -281,29 +286,24 @@ class OrchestratorCore {
           `Δshopify=${deltaShopify}, Δalegra=${deltaAlegra} → nuevo=${newGlobal}`,
       );
 
-      // ── 4. Actualizar master_inventory ──────────────────────────────────
-      await prisma.masterInventory.update({
-        where: { sku },
-        data:  {
-          stockGlobal:      newGlobal,
-          // Solo actualizar stockShopifyLast si hay tracking real.
-          // Sin tracking, Shopify siempre reporta 0 → no actualizar _last para
-          // evitar que el siguiente ciclo calcule un falso delta de tamaño newGlobal.
-          stockShopifyLast: shopifyTracking === 'shopify' ? newGlobal : master.stockShopifyLast,
-          stockAlegraLast:  newGlobal,
-          lastUpdated:      new Date(),
-          lastUpdatedBy:    'orchestrator',
-        },
-      });
-
-      // ── 5. Propagar a ambas plataformas ──────────────────────────────────
+      // ── 4. Propagar a ambas plataformas ──────────────────────────────────
       const sourceRef = `poll_${Date.now()}_${sku}`;
+      let shopifyWriteOk = false;
+      let alegraWriteOk   = false;
 
       // Solo actualizar stock en Shopify si la variante tiene tracking activado.
       // inventory_management = null significa que Shopify no controla el inventario
       // de esta variante — setInventoryLevel devuelve 422 en ese caso.
       if (shopifyTracking === 'shopify') {
-        await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+        try {
+          await shopifyConnector.setInventoryLevel(shopifyInventoryItemId, newGlobal);
+          shopifyWriteOk = true;
+        } catch (err) {
+          logger.warn(
+              `SKU ${sku}: no se pudo escribir stock en Shopify ` +
+              `(inventory_item ${shopifyInventoryItemId}): ${(err as Error).message}`,
+          );
+        }
       } else {
         logger.debug(
             `SKU ${sku}: omitiendo setInventoryLevel en Shopify ` +
@@ -314,15 +314,33 @@ class OrchestratorCore {
 
       const adjustQty = newGlobal - currentAlegra;
       if (adjustQty !== 0) {
-        await alegraConnector.adjustStock(
-            alegraItemId,
-            adjustQty,
-            `Sync Bagatta Middleware — Δshopify:${deltaShopify} Δalegra:${deltaAlegra}`,
-            entry.lastKnownCost.toNumber(),  // preservar costo promedio en Alegra
-        );
+        try {
+          await alegraConnector.adjustStock(
+              alegraItemId,
+              adjustQty,
+              `Sync Bagatta Middleware — Δshopify:${deltaShopify} Δalegra:${deltaAlegra}`,
+              entry.lastKnownCost.toNumber(),  // preservar costo promedio en Alegra
+          );
+          alegraWriteOk = true;
+        } catch (err) {
+          logger.warn(
+              `SKU ${sku}: no se pudo ajustar stock en Alegra (item ${alegraItemId}): ${(err as Error).message}`,
+          );
+        }
       }
 
-      // ── 6. Audit log stock ────────────────────────────────────────────────
+      // ── 5. Persistir el nuevo snapshot y auditar ─────────────────────────
+      await prisma.masterInventory.update({
+        where: { sku },
+        data:  {
+          stockGlobal:      newGlobal,
+          stockShopifyLast: shopifyTracking === 'shopify' && shopifyWriteOk ? newGlobal : master.stockShopifyLast,
+          stockAlegraLast:  alegraWriteOk ? newGlobal : master.stockAlegraLast,
+          lastUpdated:      new Date(),
+          lastUpdatedBy:    'orchestrator',
+        },
+      });
+
       await auditService.logStockChange({
         sku,
         oldStock:       oldGlobal,
@@ -792,6 +810,7 @@ class OrchestratorCore {
         // ya lo detectan en su próximo tick (30-60s), sin esperar hasta 15 min.
         catalogCache.upsert({
           sku:                    variant.sku,
+          shopifyVariantId:       String(variant.id),
           shopifyInventoryItemId: String(variant.inventory_item_id),
           alegraItemId:           String(alegraItem.id),
           lastKnownCost:          cost,
@@ -1525,7 +1544,20 @@ class OrchestratorCore {
             const fresh = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
             if (!fresh) return false;
 
-            const deltaAlegra = fresh.stockAlegraLast - currentAlegra;
+            // Re-leer stock actual en Alegra para este SKU específico.
+            // El bulk fetch inicial puede tener hasta ~2s de antigüedad y,
+            // combinado con escrituras concurrentes (polling cycle, fastShopifySync),
+            // puede generar "deltas fantasma". Una lectura puntual aquí elimina
+            // ese riesgo con un coste mínimo (solo para SKUs con delta preview ≠ 0).
+            let currentAlegraFresh = currentAlegra;
+            try {
+              const alegraItem = await alegraConnector.getItem(entry.alegraItemId);
+              currentAlegraFresh = alegraItem.inventory?.warehouses?.[0]?.availableQuantity ?? 0;
+            } catch (err) {
+              logger.warn(`[FastAlegraSync] SKU ${entry.sku}: no se pudo releer Alegra, usando bulk fetch: ${(err as Error).message}`);
+            }
+
+            const deltaAlegra = fresh.stockAlegraLast - currentAlegraFresh;
             if (deltaAlegra === 0) return false; // otro proceso ya lo dejó al día mientras esperábamos
 
             const oldGlobal = fresh.stockGlobal;
@@ -1567,7 +1599,10 @@ class OrchestratorCore {
               where: { sku: entry.sku },
               data:  {
                 stockGlobal:     newGlobal,
-                stockAlegraLast: newGlobal,
+                // stockAlegraLast debe reflejar lo que Alegra REALMENTE tiene ahora
+                // (currentAlegraFresh), no el stock global calculado. Así evitamos
+                // "deltas fantasma" si Shopify y Alegra están desfasados.
+                stockAlegraLast: currentAlegraFresh,
                 // Solo si la escritura a Shopify fue exitosa marcamos ese lado
                 // como sincronizado. Si falló o no se pudo escribir, dejamos el
                 // valor anterior — así el ciclo lento sabe que ese lado sigue
@@ -1672,23 +1707,34 @@ class OrchestratorCore {
         const deltaShopifyPreview = knownShopifyStock - currentShopify;
         if (deltaShopifyPreview === 0) continue;
 
-        try {
-          const didChange = await this.skuMutex.runExclusive(entry.sku, async (): Promise<boolean> => {
-            // Releer fresco DENTRO del candado — mismo motivo que en fastAlegraSync:
-            // evitar sobrescribir una corrección concurrente con una lectura vieja.
-            const fresh = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
-            if (!fresh) return false;
+try {
+           const didChange = await this.skuMutex.runExclusive(entry.sku, async (): Promise<boolean> => {
+             // Releer fresco DENTRO del candado — mismo motivo que en fastAlegraSync:
+             // evitar sobrescribir una corrección concurrente con una lectura vieja.
+             const fresh = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
+             if (!fresh) return false;
 
-            const deltaShopify = fresh.stockShopifyLast - currentShopify;
-            if (deltaShopify === 0) return false; // otro proceso ya lo dejó al día
+             // Re-leer stock actual en Shopify para este SKU específico.
+             // El bulk fetch inicial puede tener antigüedad y, combinado con escrituras
+             // concurrentes (polling cycle, fastAlegraSync), puede generar "deltas fantasma".
+             let currentShopifyFresh = currentShopify;
+             try {
+               const variantData = await shopifyConnector.getVariant(entry.shopifyVariantId);
+               currentShopifyFresh = await shopifyConnector.getInventoryLevel(variantData.inventory_item_id);
+             } catch (err) {
+               logger.warn(`[FastShopifySync] SKU ${entry.sku}: no se pudo releer Shopify, usando bulk fetch: ${(err as Error).message}`);
+             }
 
-            const oldGlobal = fresh.stockGlobal;
-            const newGlobal = Math.max(0, oldGlobal - deltaShopify);
+             const deltaShopify = fresh.stockShopifyLast - currentShopifyFresh;
+             if (deltaShopify === 0) return false; // otro proceso ya lo dejó al día
 
-            logger.info(
-                `[FastShopifySync] SKU ${entry.sku}: cambio detectado en Shopify ` +
-                `(Δ=${deltaShopify}) → nuevo stock global=${newGlobal}`,
-            );
+             const oldGlobal = fresh.stockGlobal;
+             const newGlobal = Math.max(0, oldGlobal - deltaShopify);
+
+             logger.info(
+                 `[FastShopifySync] SKU ${entry.sku}: cambio detectado en Shopify ` +
+                 `(Δ=${deltaShopify}) → nuevo stock global=${newGlobal}`,
+             );
 
             // ── Escribir a Alegra PRIMERO, y solo marcar stockAlegraLast como
             // sincronizado si esa escritura tuvo éxito real (mismo cuidado que
@@ -1713,7 +1759,11 @@ class OrchestratorCore {
               where: { sku: entry.sku },
               data:  {
                 stockGlobal:      newGlobal,
-                stockShopifyLast: newGlobal,
+                // Solo marcamos stockShopifyLast como sincronizado si la re-lectura
+                // de Shopify coincide con lo que acabamos de escribir (newGlobal).
+                // Si la re-lectura falló, conservamos el valor fresco de BD para
+                // no crear "deltas fantasma" que el polling reaplicaría.
+                stockShopifyLast: currentShopifyFresh === newGlobal ? newGlobal : fresh.stockShopifyLast,
                 stockAlegraLast:  alegraWriteOk ? newGlobal : fresh.stockAlegraLast,
                 lastUpdated:      new Date(),
                 lastUpdatedBy:    'fast_shopify_sync',
