@@ -13,47 +13,56 @@ import { KeyedMutex } from '../utils/keyedMutex';
 import { catalogCache } from '../services/catalogCache';
 
 /**
- * Rastrea, por unos segundos, qué valores acabamos de escribir NOSOTROS
- * MISMOS en un sistema externo (Shopify o Alegra) — para que el job
- * "hermano" (el que sincroniza en la dirección contraria) pueda reconocer
- * cuando el cambio que está viendo es solo el REFLEJO de una corrección que
- * ya se hizo momentos antes, y no algo nuevo que haya que volver a propagar.
+ * BUG DE PRODUCCION CORREGIDO (SKU 90003, 26 jul 2026): el mecanismo anterior
+ * (RecentWriteTracker.isEcho) comparaba el valor que ACABAMOS de escribir en
+ * un sistema externo contra el valor que ese mismo sistema reportaba al
+ * volver a leerlo momentos despues. Eso asume lectura-tras-escritura
+ * inmediata -- pero Alegra tardo ~60-70s en reflejar en su propia API un
+ * ajuste que su respuesta HTTP ya habia confirmado como exitoso. Durante esa
+ * ventana, fastAlegraSync leyo el valor viejo, el valor no coincidia con el
+ * eco registrado, lo interpreto como una venta nueva, y volvio a empujar a
+ * Shopify -- deshaciendo la correccion real del usuario y corrompiendo el
+ * stock de forma silenciosa y permanente.
  *
- * Por qué existe: fastAlegraSync y fastShopifySync corren en relojes de 60s
- * completamente independientes. Si fastAlegraSync escribe una venta real de
- * Alegra hacia Shopify, y fastShopifySync — sin saber que ese cambio en
- * Shopify fue causado por su propio hermano — lo interpreta como un evento
- * de negocio nuevo, puede volver a escribir un ajuste hacia Alegra,
- * restando una unidad que nunca se vendió ahí. Esto rompe ese eco.
+ * La comparacion por VALOR es fragil ante cualquier lag de este tipo (y no
+ * hay forma de garantizar que un tercero como Alegra sea consistente de
+ * inmediato). La solucion robusta no es comparar valores -- es dejar de
+ * *mirar* ese lado por un rato: cuando un job escribe en el sistema del
+ * hermano para un SKU, ese SKU entra en "cooldown" y el hermano lo IGNORA
+ * por completo durante la ventana (no compara, no reescribe nada) -- sin
+ * importar que valor (viejo o nuevo) devuelva la API mientras tanto.
+ * Nuestro propio stockAlegraLast/stockShopifyLast ya quedo correcto en el
+ * momento de la escritura; en cuanto expire el cooldown, si la API externa
+ * ya se puso al dia, el delta sale en 0 y no pasa nada -- autocorrectivo,
+ * sin depender de que el timing coincida.
  */
-class RecentWriteTracker {
-  private writes = new Map<string, { value: number; expiresAt: number }>();
+class WriteCooldown {
+  private until = new Map<string, number>();
 
-  /** TTL generoso: más largo que el intervalo de ambos jobs (60s), para
-   * cubrir el peor caso de timing cruzado entre ticks consecutivos. */
-  record(sku: string, value: number, ttlMs: number = 90_000): void {
-    this.writes.set(sku, { value, expiresAt: Date.now() + ttlMs });
+  /** Ventana generosa: cubre el peor lag de lectura-tras-escritura visto en
+   * produccion con Alegra (~70s) mas margen, y ambos ciclos son de 60s. */
+  set(sku: string, ttlMs: number = 120_000): void {
+    this.until.set(sku, Date.now() + ttlMs);
   }
 
-  /** true si el valor que se está viendo ahora coincide con lo que
-   * nosotros mismos escribimos hace poco — es decir, es un eco, no un
-   * evento nuevo que haya que propagar de vuelta. */
-  isEcho(sku: string, currentValue: number): boolean {
-    const record = this.writes.get(sku);
-    if (!record) return false;
-    if (Date.now() > record.expiresAt) {
-      this.writes.delete(sku);
+  /** true si este SKU fue tocado por el job hermano hace poco -- en ese caso
+   * NO se debe procesar (ni comparar, ni escribir) hasta que expire. */
+  isActive(sku: string): boolean {
+    const expiresAt = this.until.get(sku);
+    if (!expiresAt) return false;
+    if (Date.now() > expiresAt) {
+      this.until.delete(sku);
       return false;
     }
-    return record.value === currentValue;
+    return true;
   }
 }
 
-// Una instancia por dirección — lo que escribimos EN Shopify (para que
-// fastShopifySync reconozca sus propios ecos), y lo que escribimos EN
-// Alegra (para que fastAlegraSync reconozca los suyos).
-const shopifyWriteTracker = new RecentWriteTracker();
-const alegraWriteTracker  = new RecentWriteTracker();
+// Una instancia por direccion -- SKUs recien tocados EN Shopify (para que
+// fastShopifySync los ignore un rato), y SKUs recien tocados EN Alegra
+// (para que fastAlegraSync los ignore un rato).
+const shopifyWriteCooldown = new WriteCooldown();
+const alegraWriteCooldown  = new WriteCooldown();
 
 class OrchestratorCore {
   private isSyncing   = false;
@@ -1579,27 +1588,24 @@ class OrchestratorCore {
             const fresh = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
             if (!fresh) return false;
 
+            // ── Cooldown en vez de eco por valor ──────────────────────────────
+            // Si fastShopifySync escribió en Alegra para este SKU hace poco,
+            // NO confiamos en nada de lo que Alegra reporte todavía — su API
+            // puede tardar ~60-70s en reflejar su propia escritura (esto fue
+            // lo que causó la corrupción del SKU 90003: leímos el valor viejo,
+            // no coincidía con el eco esperado, y lo tratamos como venta nueva).
+            // Ignoramos el SKU por completo hasta que expire el cooldown; nuestro
+            // stockAlegraLast ya quedó correcto en el momento de esa escritura.
+            if (alegraWriteCooldown.isActive(entry.sku)) {
+              logger.info(
+                  `[FastAlegraSync] SKU ${entry.sku}: en cooldown por una corrección propia ` +
+                  `reciente (fastShopifySync) — se ignora este ciclo, sin comparar ni escribir.`,
+              );
+              return false;
+            }
+
             const deltaAlegra = fresh.stockAlegraLast - currentAlegra;
             if (deltaAlegra === 0) return false; // otro proceso ya lo dejó al día mientras esperábamos
-
-            // ── Detección de eco ─────────────────────────────────────────────
-            // Si este valor en Alegra coincide con lo que fastShopifySync
-            // escribió ahí mismo hace poco (su propia corrección por un cambio
-            // real en Shopify), esto NO es un evento de negocio nuevo — es solo
-            // el reflejo de esa corrección. Propagarlo de vuelta a Shopify
-            // restaría unidades que nunca se vendieron ahí. Solo sincronizamos
-            // nuestro registro interno, sin tocar Shopify.
-            if (alegraWriteTracker.isEcho(entry.sku, currentAlegra)) {
-              logger.info(
-                  `[FastAlegraSync] SKU ${entry.sku}: valor en Alegra (${currentAlegra}) es eco de una ` +
-                  `corrección propia reciente (fastShopifySync) — sincronizando registro sin reenviar a Shopify.`,
-              );
-              await prisma.masterInventory.update({
-                where: { sku: entry.sku },
-                data:  { stockAlegraLast: currentAlegra, lastUpdated: new Date(), lastUpdatedBy: 'fast_alegra_sync_echo' },
-              });
-              return false; // no cuenta como "cambio" real aplicado
-            }
 
             const oldGlobal = fresh.stockGlobal;
             const newGlobal = Math.max(0, oldGlobal - deltaAlegra);
@@ -1623,10 +1629,10 @@ class OrchestratorCore {
               try {
                 await shopifyConnector.setInventoryLevel(Number(entry.shopifyInventoryItemId), newGlobal);
                 shopifyWriteOk = true;
-                // Registrar: "esto lo escribimos NOSOTROS" — así fastShopifySync
-                // no lo confunde con una venta nueva en Shopify y evita re-restar
-                // en Alegra lo que ya se sincronizó desde acá.
-                shopifyWriteTracker.record(entry.sku, newGlobal);
+                // Marcar cooldown: "acabamos de tocar este SKU en Shopify" — así
+                // fastShopifySync lo ignora un rato en vez de intentar comparar
+                // contra un valor que Shopify puede tardar en reflejar.
+                shopifyWriteCooldown.set(entry.sku);
               } catch (shopifyErr) {
                 logger.warn(
                     `[FastAlegraSync] SKU ${entry.sku}: no se pudo escribir a Shopify ` +
@@ -1756,26 +1762,21 @@ class OrchestratorCore {
             const fresh = await prisma.masterInventory.findUnique({ where: { sku: entry.sku } });
             if (!fresh) return false;
 
-            const deltaShopify = fresh.stockShopifyLast - currentShopify;
-            if (deltaShopify === 0) return false; // otro proceso ya lo dejó al día
-
-            // ── Detección de eco ─────────────────────────────────────────────
-            // Si este valor en Shopify coincide con lo que fastAlegraSync
-            // escribió ahí hace poco (su propia corrección por una venta real
-            // en Alegra), esto NO es un evento de negocio nuevo. Propagarlo de
-            // vuelta a Alegra restaría unidades que nunca se vendieron ahí —
-            // exactamente el bug que causó la pérdida fantasma de stock.
-            if (shopifyWriteTracker.isEcho(entry.sku, currentShopify)) {
+            // ── Cooldown en vez de eco por valor ──────────────────────────────
+            // Simétrico a fastAlegraSync: si fastAlegraSync escribió en Shopify
+            // para este SKU hace poco, ignoramos el SKU por completo hasta que
+            // expire el cooldown, en vez de confiar en que Shopify ya refleja
+            // ese valor exacto en este instante.
+            if (shopifyWriteCooldown.isActive(entry.sku)) {
               logger.info(
-                  `[FastShopifySync] SKU ${entry.sku}: valor en Shopify (${currentShopify}) es eco de una ` +
-                  `corrección propia reciente (fastAlegraSync) — sincronizando registro sin reenviar a Alegra.`,
+                  `[FastShopifySync] SKU ${entry.sku}: en cooldown por una corrección propia ` +
+                  `reciente (fastAlegraSync) — se ignora este ciclo, sin comparar ni escribir.`,
               );
-              await prisma.masterInventory.update({
-                where: { sku: entry.sku },
-                data:  { stockShopifyLast: currentShopify, lastUpdated: new Date(), lastUpdatedBy: 'fast_shopify_sync_echo' },
-              });
               return false;
             }
+
+            const deltaShopify = fresh.stockShopifyLast - currentShopify;
+            if (deltaShopify === 0) return false; // otro proceso ya lo dejó al día
 
             const oldGlobal = fresh.stockGlobal;
             const newGlobal = Math.max(0, oldGlobal - deltaShopify);
@@ -1797,10 +1798,11 @@ class OrchestratorCore {
                   entry.lastKnownCost,
               );
               alegraWriteOk = true;
-              // Registrar: "esto lo escribimos NOSOTROS" — así fastAlegraSync no
-              // lo confunde con una venta nueva en Alegra y evita re-restar en
-              // Shopify lo que ya se sincronizó desde acá.
-              alegraWriteTracker.record(entry.sku, newGlobal);
+              // Marcar cooldown: "acabamos de tocar este SKU en Alegra" — así
+              // fastAlegraSync lo ignora un rato en vez de intentar comparar
+              // contra un valor que Alegra puede tardar en reflejar (esto fue
+              // exactamente lo que rompió el SKU 90003).
+              alegraWriteCooldown.set(entry.sku);
             } catch (alegraErr) {
               logger.warn(
                   `[FastShopifySync] SKU ${entry.sku}: no se pudo escribir a Alegra: ` +
