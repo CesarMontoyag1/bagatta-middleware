@@ -858,6 +858,7 @@ class OrchestratorCore {
           shopifyInventoryItemId: String(variant.inventory_item_id),
           alegraItemId:           String(alegraItem.id),
           lastKnownCost:          cost,
+          lastKnownPrice:         price,
         });
 
         // ── Insertar en master_inventory ──────────────────────────────────
@@ -1034,6 +1035,17 @@ class OrchestratorCore {
           where: { shopifyVariantId: String(variant.id) },
           data:  updates,
         });
+
+        // Si cambió el precio, reflejarlo en la caché al instante — si no,
+        // el chequeo de precio de fastAlegraSync compararía el precio real de
+        // Alegra (que este mismo webhook ya actualizó) contra un precio
+        // cacheado viejo, y lo "revertiría" de vuelta al valor desactualizado.
+        if (updates.lastKnownPrice !== undefined) {
+          const cachedPrice = catalogCache.get(currentSku);
+          if (cachedPrice) {
+            catalogCache.upsert({ ...cachedPrice, lastKnownPrice: updates.lastKnownPrice as number });
+          }
+        }
 
         // Si cambió el costo, reflejarlo en la caché al instante — si no,
         // fastShopifySync seguiría usando el costo viejo al ajustar Alegra
@@ -1537,10 +1549,14 @@ class OrchestratorCore {
       // ── 1. Traer TODOS los ítems de Alegra en bloque (pocas llamadas) ─────
       const alegraItems = await alegraConnector.getSyncedItems();
       const alegraStockByRef = new Map<string, number>();
+      const alegraPriceByRef = new Map<string, number>();
       for (const item of alegraItems) {
         const ref = item.reference?.trim();
         if (!ref) continue;
         alegraStockByRef.set(ref, item.inventory?.warehouses?.[0]?.availableQuantity ?? 0);
+        // El precio ya viene incluido en este mismo objeto — no cuesta ni una
+        // llamada ni un byte de más pedirlo; ya está en memoria.
+        alegraPriceByRef.set(ref, item.price?.[0]?.price ?? 0);
       }
 
       // ── 2. Metadata del catálogo — desde la caché en memoria, NO de Supabase ──
@@ -1564,6 +1580,37 @@ class OrchestratorCore {
 
       // ── 3. Comparar en memoria — sin llamar a Alegra ni Shopify por SKU ───
       for (const entry of catalogEntries) {
+        // ── Precio: chequeo barato, independiente del stock ──────────────────
+        // Antes esto solo lo revisaba el ciclo lento (cada 30 min, y a veces
+        // ni eso — se saltaba entero si había un catchup en curso). Acá no
+        // cuesta nada extra: alegraPriceByRef ya viene del mismo llamado a
+        // getSyncedItems() de arriba, y entry.lastKnownPrice ya viene de
+        // catalogCache (RAM, no Supabase). Se corrige en cuanto se detecta,
+        // sin esperar al ciclo lento.
+        const alegraPrice = alegraPriceByRef.get(entry.sku);
+        if (
+            alegraPrice !== undefined &&
+            entry.lastKnownPrice > 0 &&
+            Math.abs(alegraPrice - entry.lastKnownPrice) > 0.01
+        ) {
+          try {
+            logger.warn(
+                `[FastAlegraSync] SKU ${entry.sku}: precio Alegra (${alegraPrice}) ≠ ` +
+                `master Shopify (${entry.lastKnownPrice}). Revirtiendo.`,
+            );
+            await alegraConnector.updateItemPrice(entry.alegraItemId, entry.lastKnownPrice);
+            await auditService.logPriceChange({
+              sku:            entry.sku,
+              oldPrice:       alegraPrice,
+              newPrice:       entry.lastKnownPrice,
+              origin:         'alegra_polling',
+              sourceEventRef: `price_revert_fast_${Date.now()}_${entry.sku}`,
+            });
+          } catch (err) {
+            result.errors.push(`Error revirtiendo precio SKU ${entry.sku}: ${(err as Error).message}`);
+          }
+        }
+
         const knownAlegraStock = stockAlegraLastBySku.get(entry.sku);
         if (knownAlegraStock === undefined) continue; // aún sin fila de inventory
 

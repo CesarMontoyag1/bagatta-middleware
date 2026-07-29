@@ -28,6 +28,7 @@ export interface CatalogCacheEntry {
     shopifyVariantId:        string;
     alegraItemId:            string;
     lastKnownCost:           number;
+    lastKnownPrice:          number;
 }
 
 class CatalogCache {
@@ -44,6 +45,7 @@ class CatalogCache {
                 shopifyVariantId:       true,
                 alegraItemId:           true,
                 lastKnownCost:          true,
+                lastKnownPrice:         true,
             },
         });
 
@@ -55,6 +57,7 @@ class CatalogCache {
                 shopifyVariantId:       row.shopifyVariantId,
                 alegraItemId:           row.alegraItemId,
                 lastKnownCost:          row.lastKnownCost.toNumber(),
+                lastKnownPrice:         row.lastKnownPrice.toNumber(),
             });
         }
 
