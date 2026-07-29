@@ -252,10 +252,18 @@ class AlegraConnector {
   }
 
   async updateItemPrice(alegraItemId: string, price: number): Promise<void> {
+    // BUG: esto usaba idPriceList hardcodeado en 1. En Alegra Colombia el
+    // idPriceList real es un UUID (ver alegraBootstrap.ts), no el entero 1 —
+    // por eso el ítem 322 (SKU 90298) devolvió 400 "no se encontró la lista
+    // de precios con id: 1": esa cuenta simplemente no tiene una lista con
+    // ese id. La creación de ítems (core.ts) ya usaba el id real resuelto en
+    // el bootstrap; esta función nunca se actualizó para hacer lo mismo.
+    const { accountTemplate } = getAlegraIds();
+    const idPriceList = accountTemplate?.priceListId ?? 1;
     await this.client.put(`/items/${alegraItemId}`, {
-      price: [{ idPriceList: 1, price }],
+      price: [{ idPriceList, price }],
     });
-    logger.debug(`Alegra: ítem ${alegraItemId} precio → ${price}`);
+    logger.debug(`Alegra: ítem ${alegraItemId} precio → ${price} (idPriceList=${idPriceList})`);
   }
 
   async updateItemCost(alegraItemId: string, cost: number): Promise<void> {
